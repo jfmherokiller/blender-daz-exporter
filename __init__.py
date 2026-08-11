@@ -10,7 +10,7 @@ against a live session, without needing the addon registered). See
 bl_info = {
     "name": "Daz Studio Native Export (.duf)",
     "author": "Blender DUF Exporter",
-    "version": (0, 2, 0),
+    "version": (0, 2, 1),
     "blender": (3, 0, 0),
     "location": "File > Export > Daz Studio Scene (.duf)",
     "description": "Export a rigged mesh (or multiple meshes sharing one armature, optionally as conforming clothing) as a native Daz Studio .duf scene file",
@@ -217,13 +217,59 @@ def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_daz_duf.bl_idname, text="Daz Studio Scene (.duf)")
 
 
+class MATERIAL_PT_daz_export(bpy.types.Panel):
+    """"Hide from Daz Export" toggle, shown in the Material Properties tab.
+
+    A checkbox on the material rather than a face/vertex selection because
+    material is the natural unit for "geometry Daz's renderer handles badly"
+    - it's how the tail fix that motivated this feature was actually found
+    (a whole material zone, "HairCards", not an arbitrary face selection).
+    export_duf()/_build_mesh_prop()/export_duf_prop() all read this via
+    duf_export._ensure_hide_material_shapekeys() at export time.
+    """
+    bl_label = "Daz Export"
+    bl_idname = "MATERIAL_PT_daz_export"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        return context.material is not None
+
+    def draw(self, context):
+        layout = self.layout
+        mat = context.material
+        layout.prop(mat, "daz_hide_on_export")
+        if mat.daz_hide_on_export:
+            layout.label(text="Faces using this material collapse to ~0 scale on export",
+                         icon="INFO")
+            layout.label(text="(via an auto-generated shape key - geometry isn't deleted,")
+            layout.label(text="so other morphs stay intact)")
+
+
 def register():
     bpy.utils.register_class(EXPORT_OT_daz_duf)
+    bpy.utils.register_class(MATERIAL_PT_daz_export)
+    bpy.types.Material.daz_hide_on_export = bpy.props.BoolProperty(
+        name="Hide From Daz Export",
+        description=(
+            "Collapse every face using this material to near-zero size via an "
+            "auto-generated shape key on export, instead of deleting them. Use for "
+            "geometry Daz Studio's Iray renderer handles badly (e.g. a disconnected "
+            "card-based hair/fur shell casting unwanted shadows) without breaking "
+            "other shape keys/morphs, which reference vertices by index and silently "
+            "corrupt if geometry is actually deleted"
+        ),
+        default=False,
+    )
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    del bpy.types.Material.daz_hide_on_export
+    bpy.utils.unregister_class(MATERIAL_PT_daz_export)
     bpy.utils.unregister_class(EXPORT_OT_daz_duf)
 
 

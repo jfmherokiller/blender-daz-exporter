@@ -654,6 +654,12 @@ _IRAY_SOCKET_MAP = [
 # Blender 4.0+ renamed these two; try the new name, fall back to the old one.
 _SPECULAR_ALIASES = ("Specular IOR Level", "Specular")
 _TRANSMISSION_ALIASES = ("Transmission Weight", "Transmission")
+# Same story for Clearcoat -> Coat (renamed in Blender 4.0, which also added a
+# tint/IOR pair the older Principled BSDF never had - aliases resolve to None
+# there via _find_socket, which resolve() already treats as "no override".
+_COAT_WEIGHT_ALIASES = ("Coat Weight", "Clearcoat")
+_COAT_ROUGHNESS_ALIASES = ("Coat Roughness", "Clearcoat Roughness")
+_COAT_TINT_ALIASES = ("Coat Tint",)
 
 
 def _find_socket(bsdf, aliases):
@@ -773,13 +779,69 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
     elif img:
         overrides["Refraction Weight"] = (1.0, img)
 
+    # IOR: direct 1:1 value - both Blender's "IOR" socket and Daz's
+    # "Refraction Index" channel are the same physical quantity (Blender
+    # default 1.45, Daz's Iray Uber template default 1.5 - close enough that
+    # writing the actual value is strictly more correct than leaving the
+    # template default).
+    ior_inp = bsdf.inputs.get("IOR")
+    val, img = resolve(ior_inp, "IOR")
+    if val is not None:
+        overrides["Refraction Index"] = (val, None)
+    elif img:
+        overrides["Refraction Index"] = (1.5, img)
+
+    # Clearcoat/Coat: same value/map priority as every other channel above.
+    # Roughness/tint are only worth writing once a non-zero coat weight is
+    # actually present (Top Coat Weight's template default is 0 - inert - so
+    # a coat-less material has nothing for roughness/tint to visibly affect).
+    coat_weight_inp = _find_socket(bsdf, _COAT_WEIGHT_ALIASES)
+    val, img = resolve(coat_weight_inp, "CoatWeight")
+    if val is not None and val > 0:
+        overrides["Top Coat Weight"] = (val, None)
+    elif img:
+        overrides["Top Coat Weight"] = (1.0, img)
+
+    if "Top Coat Weight" in overrides:
+        coat_rough_inp = _find_socket(bsdf, _COAT_ROUGHNESS_ALIASES)
+        val, img = resolve(coat_rough_inp, "CoatRoughness")
+        if val is not None:
+            overrides["Top Coat Roughness"] = (val, None)
+        elif img:
+            overrides["Top Coat Roughness"] = (1.0, img)
+
+        coat_tint_inp = _find_socket(bsdf, _COAT_TINT_ALIASES)
+        val, img = resolve(coat_tint_inp, "CoatTint")
+        if val is not None:
+            overrides["Top Coat Color"] = (list(val[:3]), None)
+        elif img:
+            overrides["Top Coat Color"] = ([1.0, 1.0, 1.0], img)
+
     normal_inp = bsdf.inputs.get("Normal")
     if normal_inp is not None and normal_inp.is_linked:
-        # normal maps: reuse only, never bake (EMIT-baking would re-encode the
-        # already-tangent-space-correct map incorrectly)
-        normal_img = _direct_image(normal_inp, textures_dir, f"{id_prefix}_Normal")
-        if normal_img:
-            overrides["Normal Map"] = (1.0, normal_img)
+        normal_from_node = normal_inp.links[0].from_node
+        if normal_from_node.type == "BUMP":
+            # Height-based bump (Blender's Bump node) rather than a
+            # tangent-space Normal Map - maps to Daz's separate "Bump
+            # Strength" channel instead of "Normal Map". Only the map is
+            # written, not a translated strength value: Blender's Bump
+            # "Strength" is a 0-1 multiplier while Daz's "Bump Strength"
+            # channel is a 0-50 range whose own template default (5, see
+            # iray_uber_channels_template.json) is already a sane
+            # "map present" working value - not confirmed live what scale
+            # factor would correctly translate one range into the other, so
+            # this leaves that value at the template default rather than
+            # guess and risk a far-too-strong or near-invisible result.
+            height_inp = normal_from_node.inputs.get("Height")
+            _, bump_img = resolve(height_inp, "Bump")
+            if bump_img:
+                overrides["Bump Strength"] = (None, bump_img)
+        else:
+            # normal maps: reuse only, never bake (EMIT-baking would re-encode
+            # the already-tangent-space-correct map incorrectly)
+            normal_img = _direct_image(normal_inp, textures_dir, f"{id_prefix}_Normal")
+            if normal_img:
+                overrides["Normal Map"] = (1.0, normal_img)
 
     return diffuse_rgb, diffuse_image, overrides
 
@@ -943,7 +1005,89 @@ def _smooth_sparse_deltas(raw_deltas, adjacency, iterations=2, factor=0.5):
     return current
 
 
-def _build_morphs(mesh_obj, geo_id, geo_instance_id, mesh_id, smooth_iterations=2, smooth_factor=0.5):
+def _ensure_hide_material_shapekeys(mesh_obj):
+    """
+    For every material on mesh_obj flagged `daz_hide_on_export=True` (a
+    custom property the addon registers on bpy.types.Material - see
+    __init__.py's MATERIAL_PT_daz_export panel), ensure a shape key exists
+    that collapses that material's faces to near-zero scale, and return
+    their names so the caller can pass them to _build_morphs' `force_active`
+    param (channel default 1.0 - "hidden" is the rest state, no manual
+    dialing needed once loaded in Daz).
+
+    Found live: Daz's Iray renderer can make certain geometry (confirmed:
+    a disconnected card-based hair shell, not topologically joined to the
+    rest of the mesh) look badly wrong - hard-edged black banding that
+    survived every material-property fix tried (Cutout Opacity, Diffuse
+    Color, environment lighting) - most likely from shadow-casting/AO
+    contribution that Cutout Opacity alone doesn't suppress. Actually
+    shrinking the geometry away (not just hiding its material) fixed it.
+
+    Deliberately does NOT delete geometry: other modifiers/shape keys
+    reference vertices by index, and deleting changes indices out from under
+    them - confirmed live this breaks other morphs. A near-zero-scale shape
+    key is topology-preserving (same vertex/polygon count and indices) and
+    safe to add alongside existing morphs.
+
+    Collapses each vertex toward the average center of its own owning
+    hidden-material face(s) - a cheap stand-in for scaling with an
+    "Individual Origins" pivot in Blender, so the geometry visually
+    collapses roughly in place instead of every vertex converging on one
+    shared point. A vertex that's ALSO used by a non-hidden material's face
+    is left untouched even if it touches a hidden face too - collapsing a
+    shared boundary vertex would distort the geometry that's being kept.
+
+    Idempotent: if a shape key of the expected name already exists, it's
+    left as-is and just reported back - safe to call on every export
+    without piling up duplicates as the user iterates, and lets a user
+    hand-tune the collapse afterward (e.g. a different scale factor) without
+    losing their edit on the next export.
+    """
+    mesh = mesh_obj.data
+    hide_mat_indices = [
+        i for i, m in enumerate(mesh.materials)
+        if m is not None and getattr(m, "daz_hide_on_export", False)
+    ]
+    if not hide_mat_indices:
+        return []
+
+    if not mesh.shape_keys:
+        mesh_obj.shape_key_add(name="Basis")
+    basis = mesh.shape_keys.key_blocks[0]
+
+    created = []
+    collapse_scale = 0.001
+    for mat_idx in hide_mat_indices:
+        mat = mesh.materials[mat_idx]
+        key_name = f"DazHide_{_safe_id(mat.name)}"
+        if key_name in mesh.shape_keys.key_blocks:
+            created.append(key_name)
+            continue
+
+        hide_vert_faces = {}
+        keep_verts = set()
+        for poly in mesh.polygons:
+            if poly.material_index == mat_idx:
+                center = poly.center.copy()
+                for vi in poly.vertices:
+                    hide_vert_faces.setdefault(vi, []).append(center)
+            else:
+                keep_verts.update(poly.vertices)
+
+        sk = mesh_obj.shape_key_add(name=key_name, from_mix=False)
+        for vi, centers in hide_vert_faces.items():
+            if vi in keep_verts:
+                continue
+            pivot = sum(centers, Vector()) / len(centers)
+            orig = basis.data[vi].co
+            sk.data[vi].co = pivot + (orig - pivot) * collapse_scale
+        created.append(key_name)
+
+    return created
+
+
+def _build_morphs(mesh_obj, geo_id, geo_instance_id, mesh_id, smooth_iterations=2, smooth_factor=0.5,
+                   force_active=frozenset()):
     """
     Blender shape keys (besides the reference "Basis") -> DSON morph
     modifiers. Format confirmed against a real shipped Daz product's morph
@@ -978,14 +1122,21 @@ def _build_morphs(mesh_obj, geo_id, geo_instance_id, mesh_id, smooth_iterations=
     adjacency = _build_vertex_adjacency(mesh_obj.data) if smooth_iterations > 0 else None
 
     for kb in sk.key_blocks[1:]:
+        is_forced = kb.name in force_active
         raw = {}
         for i in range(vertex_count):
             d = kb.data[i].co - basis.data[i].co
             if d.length > 1e-6:
                 raw[i] = d
 
-        smoothed = _smooth_sparse_deltas(raw, adjacency, smooth_iterations, smooth_factor) \
-            if smooth_iterations > 0 else raw
+        # A force-active "hide geometry" shape key is a deliberate hard
+        # structural collapse, not a sculpted correction - boundary
+        # softening would partially un-collapse its edge vertices (pulling
+        # them toward their zero-delta kept-geometry neighbors) and risks
+        # bleeding a slight shrink into the geometry being kept. Skip it.
+        smoothed = raw if is_forced else (
+            _smooth_sparse_deltas(raw, adjacency, smooth_iterations, smooth_factor)
+            if smooth_iterations > 0 else raw)
 
         deltas = []
         for i, d in smoothed.items():
@@ -996,6 +1147,7 @@ def _build_morphs(mesh_obj, geo_id, geo_instance_id, mesh_id, smooth_iterations=
             continue
 
         morph_id = f"{mesh_id}_{_safe_id(kb.name)}"
+        rest_value = 1.0 if is_forced else 0.0
         modifiers_lib.append({
             "id": morph_id,
             "name": morph_id,
@@ -1005,7 +1157,7 @@ def _build_morphs(mesh_obj, geo_id, geo_instance_id, mesh_id, smooth_iterations=
                 "label": "", "description": "", "icon_large": "",
                 "colors": [[0.3529412, 0.3529412, 0.3529412], [1, 1, 1]],
             },
-            "channel": _channel("value", "float", "Value", kb.name, 0.0, 0.0, 1.0, 0.01, True) | {
+            "channel": _channel("value", "float", "Value", kb.name, rest_value, 0.0, 1.0, 0.01, True) | {
                 "display_as_percent": True,
             },
             "group": f"/Morphs/{mesh_id}",
@@ -1249,12 +1401,14 @@ def _build_mesh_figure(mesh_obj, armature_obj, textures_dir, is_root,
     def instance_id(lib_id):
         return f"{lib_id}-1"
 
+    hide_shapekey_names = _ensure_hide_material_shapekeys(mesh_obj)
     geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id)
     skin_modifier = _build_skin_binding(mesh_obj, geo_id, figure_id, mod_id, bone_id_map)
     mats_lib, mats_scene, materials_manifest = _build_materials(
         mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
     morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, instance_id(geo_id), mesh_id,
-                                              morph_smooth_iterations, morph_smooth_factor)
+                                              morph_smooth_iterations, morph_smooth_factor,
+                                              force_active=hide_shapekey_names)
 
     geometry_instance = {
         "id": instance_id(geo_id), "url": f"#{geo_id}", "name": geometry["name"],
@@ -1328,11 +1482,13 @@ def _build_mesh_prop(mesh_obj, textures_dir, morph_smooth_iterations, morph_smoo
     bbox_max_z = max((v[2] for v in mesh_obj.bound_box), default=1.0)
     end_point = to_daz_vec((0.0, 0.0, bbox_max_z))
 
+    hide_shapekey_names = _ensure_hide_material_shapekeys(mesh_obj)
     geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id)
     mats_lib, mats_scene, materials_manifest = _build_materials(
         mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
     morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, f"{geo_id}-1", mesh_id,
-                                              morph_smooth_iterations, morph_smooth_factor)
+                                              morph_smooth_iterations, morph_smooth_factor,
+                                              force_active=hide_shapekey_names)
 
     node_id = mesh_id
     node_entry = _prop_node_entry(node_id, mesh_obj.name, end_point)
@@ -1611,7 +1767,8 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
     return duf
 
 
-def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True):
+def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True,
+                     morph_smooth_iterations=2, morph_smooth_factor=0.5):
     """
     Export a single mesh as a standalone static DSON PROP - geometry and
     materials only, no skeleton/skin_binding at all (unlike export_duf's
@@ -1651,6 +1808,7 @@ def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True):
     bbox_max_z = max((v[2] for v in mesh_obj.bound_box), default=1.0)
     end_point = to_daz_vec((0.0, 0.0, bbox_max_z))
 
+    hide_shapekey_names = _ensure_hide_material_shapekeys(mesh_obj)
     geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id, world_space=True)
     mats_lib, mats_scene, materials_manifest = _build_materials(
         mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
@@ -1671,6 +1829,10 @@ def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True):
         "geometries": [geometry_instance],
     }
 
+    morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, instance_id(geo_id), mesh_id,
+                                              morph_smooth_iterations, morph_smooth_factor,
+                                              force_active=hide_shapekey_names)
+
     duf = {
         "file_version": "0.6.0.0",
         "asset_info": {
@@ -1683,10 +1845,10 @@ def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True):
         "geometry_library": [geometry],
         "uv_set_library": [uv_set],
         "material_library": mats_lib,
-        "modifier_library": [],
+        "modifier_library": morphs_lib,
         "scene": {
             "nodes": [scene_node],
-            "modifiers": [],
+            "modifiers": morphs_scene,
             "materials": mats_scene,
         },
     }
