@@ -1730,6 +1730,27 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
         if preferred_base:
             root_node_entry["presentation"]["preferred_base"] = preferred_base
 
+        # "name://@selection:" is the literal, static DSON value a real
+        # shipped wardrobe item's scene.nodes[] entry uses to auto-fit onto
+        # whatever figure is selected at load time - Daz's own "Fit to"
+        # convenience, expressed declaratively (SKILL_DSON_FORMAT.md,
+        # daz-mcp-server, 2026-08-11 ground truth: confirmed on a real
+        # dForce-ready wardrobe item's node, which ALSO ships a full
+        # weight-mapped bone hierarchy - conform_target only actually
+        # deforms when it rides on top of real weight-map data that exists
+        # first, per that same doc; a hand-authored conform_target with no
+        # underlying skin_binding is a confirmed dead end, see the "Replace
+        # conform_target..." investigation below and in git history). This
+        # export path already builds that real skin_binding from the
+        # Blender rig's own vertex-group weights (_build_skin_binding), so
+        # the precondition holds - unlike the attached-mesh case below,
+        # which instead defers to Daz's Transfer Utility for that. No
+        # DazScript needed: this is a pure declarative field on the root
+        # figure's SCENE node instance (not its node_library definition -
+        # matches every other instance-level-vs-definition split already in
+        # this file, e.g. skin_binding/morph "parent").
+        scene_nodes[0]["conform_target"] = "name://@selection:"
+
     duf = {
         "file_version": "0.6.0.0",
         "asset_info": {
