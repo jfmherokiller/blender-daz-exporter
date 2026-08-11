@@ -188,12 +188,9 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
 
         names = ", ".join(m.name for m in mesh_objs)
         fixup_script = result.get("_fixup_script")
-        rig_transfer_script = result.get("_rig_transfer_script")
         msg = f"Exported [{names}] -> {self.filepath}"
         if fixup_script:
-            msg += f" (material fixup script: {fixup_script})"
-        if rig_transfer_script:
-            msg += f" (rig transfer script: {rig_transfer_script})"
+            msg += f" (run this once after loading: {fixup_script})"
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 

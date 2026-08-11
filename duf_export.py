@@ -1212,14 +1212,17 @@ def _js_channel_value_snippet(prop_expr, value, image):
     return "\n".join(lines)
 
 
-def _write_material_fixup_script(materials_manifest_by_node, script_path,
-                                  preset_path=_BUNDLED_UBER_BASE_PRESET):
+def _material_fixup_body_lines(materials_manifest_by_node, preset_path=_BUNDLED_UBER_BASE_PRESET):
     """
-    Write a standalone DazScript (.dsa) that upgrades every material zone
+    Builds the material-fixup logic as a self-contained IIFE
+    (`["(function(){", ..., "})();"]`) that upgrades every material zone
     across a set of scene nodes from the legacy DzDefaultMaterial our raw
     .duf merge produces to genuine DzUberIrayMaterial, then re-applies the
     diffuse/PBR channel values and baked texture maps this exporter already
-    computed.
+    computed. Factored out from _write_material_fixup_script so
+    _write_combined_fixup_script can also embed this logic (nested inside
+    its own outer script) without duplicating it - see that function's
+    docstring for why a combined single-script output exists at all.
 
     materials_manifest_by_node: a list of (node_label, {group_name: {...}})
     pairs, one per exported mesh/figure - every exported mesh is its own
@@ -1231,30 +1234,39 @@ def _write_material_fixup_script(materials_manifest_by_node, script_path,
     WHY THIS EXISTS: describing a "studio_material_channels" block by hand in
     a merged .duf (what this exporter used to rely on exclusively) is not
     enough to make Daz Studio instantiate the real Iray Uber shader class -
-    confirmed by direct isolation testing (see DUF_EXPORT_NOTES.md). What
-    *does* work is going through Daz's own preset-application codepath:
-    select the node, then App.getContentMgr().openFile() a real
-    "preset_shader"-type .duf (this is exactly what happens when a user drags
-    a shader preset from Smart Content onto a figure). That path builds a
-    native shader object instead of parsing one from raw JSON, but it also
-    resets every channel to shader defaults - so step 2 re-applies our actual
-    values/maps through the live DzMaterial property API (setFloatColorValue /
-    setValue / setMap), which is confirmed to work uniformly across both
-    color and plain numeric channels.
+    confirmed by direct isolation testing (see DUF_EXPORT_NOTES.md), TWICE:
+    once with a byte-for-byte copy of a real working Iray Uber material's
+    channel data dropped into a self-contained single-file export, and again
+    (2026-08-11) with that same data moved to a genuinely separate companion
+    .dsf file (asset_info.type "preset_shader", matching how every real
+    shipped product's materials actually live on disk) and referenced via an
+    external file `url` instead of a same-document `#id` fragment - still
+    `DzDefaultMaterial` either way. Daz Studio's plain scene-merge parser
+    just never promotes a material past `DzDefaultMaterial` from raw JSON,
+    regardless of where that JSON lives. What *does* work is going through
+    Daz's own preset-application codepath: select the node, then
+    App.getContentMgr().openFile() a real "preset_shader"-type .duf (this is
+    exactly what happens when a user drags a shader preset from Smart
+    Content onto a figure). That path builds a native shader object instead
+    of parsing one from raw JSON, but it also resets every channel to shader
+    defaults - so step 2 re-applies our actual values/maps through the live
+    DzMaterial property API (setFloatColorValue / setValue / setMap), which
+    is confirmed to work uniformly across both color and plain numeric
+    channels.
 
-    This script is meant to be run once, after the .duf it's paired with has
-    been loaded/merged into the scene (e.g. via this project's `daz` MCP
-    tools: daz_load_file then daz_execute_file, or manually through Daz
-    Studio's Window > Script IDE). DSON itself has no supported hook to
-    auto-run a script on scene load, so this can't be wired to fire on its
-    own purely from the .duf - shipping it as a companion file (or driving it
-    ourselves over the live MCP bridge right after load) is the practical
-    substitute.
+    This can't be triggered automatically on scene load/merge - DSON has no
+    supported hook for that, and Daz's one real "auto-run a script" mechanism
+    (a `.dsa` under `Runtime/Support`, SKILL_PACKAGING.md) only fires once
+    per file during a Content Library directory *scan* (registering CMS
+    metadata), not each time an associated asset is actually loaded/merged
+    into a scene - confirmed by re-reading daz-mcp-server's packaging docs
+    while investigating this, not by a live test (that mechanism requires a
+    full DIM-style content-library install this project doesn't do). Meant
+    to run once, after the .duf it's paired with has been loaded/merged into
+    the scene (e.g. via this project's `daz` MCP tools: daz_load_file then
+    daz_execute_file, or manually through Daz Studio's Window > Script IDE).
     """
     lines = [
-        "// Auto-generated by blender_daz_exporter - upgrades DzDefaultMaterial",
-        "// zones to Iray Uber and restores their channel values/maps.",
-        "// See DUF_EXPORT_NOTES.md 'Materials: shader-class fixup' for why this exists.",
         "(function(){",
         f"    var presetPath = {_js_str(preset_path)};",
         "    var fixedZones = [];",
@@ -1320,6 +1332,19 @@ def _write_material_fixup_script(materials_manifest_by_node, script_path,
         "    };",
         "})();",
     ])
+    return lines
+
+
+def _write_material_fixup_script(materials_manifest_by_node, script_path,
+                                  preset_path=_BUNDLED_UBER_BASE_PRESET):
+    """Standalone-file wrapper around _material_fixup_body_lines - used when
+    there's no attached-mesh rig transfer to combine it with (see
+    _write_combined_fixup_script for the multi-mesh case)."""
+    lines = [
+        "// Auto-generated by blender_daz_exporter - upgrades DzDefaultMaterial",
+        "// zones to Iray Uber and restores their channel values/maps.",
+        "// See DUF_EXPORT_NOTES.md 'Materials: shader-class fixup' for why this exists.",
+    ] + _material_fixup_body_lines(materials_manifest_by_node, preset_path)
 
     script_text = "\n".join(lines)
     with open(script_path, "w", encoding="utf-8") as f:
@@ -1512,15 +1537,16 @@ def _build_mesh_prop(mesh_obj, textures_dir, morph_smooth_iterations, morph_smoo
     }
 
 
-def _write_rig_transfer_script(attached_mesh_labels, root_label, script_path):
+def _rig_transfer_body_lines(attached_mesh_labels, root_label):
     """
-    Write a standalone DazScript (.dsa) that promotes every attached-mesh
+    Builds the rig-transfer logic as a self-contained IIFE
+    (`["(function(){", ..., "})();"]`) that promotes every attached-mesh
     PROP (see _build_mesh_prop) to a real figure and transfers genuine bone
     weights onto it from the root figure, via Daz's own Transfer Utility -
     see _build_mesh_prop's docstring for why this replaces the old
-    conform_target approach. Meant to run once, after the .duf is loaded and
-    (if applicable) after the material fixup script - order between those
-    two doesn't matter, they touch disjoint state.
+    conform_target approach. Factored out from _write_rig_transfer_script so
+    _write_combined_fixup_script can also embed this logic - see that
+    function's docstring for why a combined single-script output exists.
 
     Each attached mesh gets its own throwaway root bone name
     ("<mesh_id>_root") to convert around - doesn't need to mean anything,
@@ -1528,11 +1554,6 @@ def _write_rig_transfer_script(attached_mesh_labels, root_label, script_path):
     deformation, not this bone's placement.
     """
     lines = [
-        "// Auto-generated by blender_daz_exporter - promotes each attached",
-        "// mesh prop to a figure and transfers real bone weights onto it",
-        "// from the root figure via Daz's Transfer Utility.",
-        "// See DUF_EXPORT_NOTES.md 'Attached-mesh rigging: Transfer Utility'",
-        "// for why this replaced the old conform_target approach.",
         "(function(){",
         f"    var rootLabel = {_js_str(root_label)};",
         "    var root = Scene.findNodeByLabel(rootLabel);",
@@ -1565,6 +1586,72 @@ def _write_rig_transfer_script(attached_mesh_labels, root_label, script_path):
         "    }",
         "",
         "    return {transferred: transferred, missing: missing};",
+        "})();",
+    ]
+    return lines
+
+
+def _write_rig_transfer_script(attached_mesh_labels, root_label, script_path):
+    """Standalone-file wrapper around _rig_transfer_body_lines - kept for
+    callers that want just this half (none currently do; export_duf() uses
+    the combined output below, see _write_combined_fixup_script)."""
+    lines = [
+        "// Auto-generated by blender_daz_exporter - promotes each attached",
+        "// mesh prop to a figure and transfers real bone weights onto it",
+        "// from the root figure via Daz's Transfer Utility.",
+        "// See DUF_EXPORT_NOTES.md 'Attached-mesh rigging: Transfer Utility'",
+        "// for why this replaced the old conform_target approach.",
+    ] + _rig_transfer_body_lines(attached_mesh_labels, root_label)
+
+    script_text = "\n".join(lines)
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_text)
+    return script_path
+
+
+def _write_combined_fixup_script(materials_manifest_by_node, attached_mesh_labels, root_label,
+                                  script_path, preset_path=_BUNDLED_UBER_BASE_PRESET):
+    """
+    One companion script combining BOTH post-load fixups a multi-mesh
+    export_duf() can need - the material shader-class fixup
+    (_material_fixup_body_lines) and the attached-mesh rig transfer
+    (_rig_transfer_body_lines) - so the user only has to find and run ONE
+    .dsa instead of two. This is the practical ceiling on "no script needed"
+    for this exporter: DzUberIrayMaterial genuinely cannot be built from raw
+    merged DSON (see _material_fixup_body_lines' docstring for the isolation
+    tests behind that conclusion, including one against a genuinely separate
+    material .dsf file), so *some* post-load step is unavoidable - cutting
+    two required scripts down to one is the real, achievable win.
+
+    Each block's own self-contained IIFE (`(function(){...})();`, built by
+    the `_..._body_lines` helpers) is reused completely unmodified - the
+    only change from either standalone-file version is prefixing its first
+    line with `var <name> = `, which is valid JS purely because each block's
+    own trailing `})();` already terminates that as one complete statement.
+
+    Order between the two blocks doesn't matter (they touch disjoint scene
+    state) - material fixup runs first here only so its result appears
+    first in the combined return value.
+    """
+    material_lines = _material_fixup_body_lines(materials_manifest_by_node, preset_path)
+    material_lines[0] = "    var materialResult = " + material_lines[0]
+    rig_lines = _rig_transfer_body_lines(attached_mesh_labels, root_label)
+    rig_lines[0] = "    var rigTransferResult = " + rig_lines[0]
+
+    lines = [
+        "// Auto-generated by blender_daz_exporter - combined post-load fixup.",
+        "// (1) upgrades DzDefaultMaterial zones to Iray Uber Base and restores",
+        "//     their channel values/maps - see 'Materials: shader-class fixup'",
+        "//     in DUF_EXPORT_NOTES.md for why this can't be done from the .duf",
+        "//     alone (Daz's scene-merge parser never promotes a material past",
+        "//     DzDefaultMaterial from raw JSON, confirmed multiple ways).",
+        "// (2) promotes each attached mesh prop to a figure and transfers real",
+        "//     bone weights from the root figure via Daz's Transfer Utility -",
+        "//     see 'Attached-mesh rigging: Transfer Utility' in the same doc.",
+        "(function(){",
+    ] + material_lines + [""] + rig_lines + [
+        "",
+        "    return {materials: materialResult, rigTransfer: rigTransferResult};",
         "})();",
     ]
     script_text = "\n".join(lines)
@@ -1601,13 +1688,16 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
     which one, must match one of mesh_objs' .name; defaults to mesh_objs[0]
     if not given). Every OTHER mesh is exported as a standalone PROP (see
     _build_mesh_prop) - geometry + materials + morphs, no skeleton/
-    skin_binding. A companion "_rig_transfer.dsa" script (see
-    _write_rig_transfer_script, path returned as duf["_rig_transfer_script"])
+    skin_binding. A companion "_fixup.dsa" script (see
+    _write_combined_fixup_script, path returned as duf["_fixup_script"])
     promotes each prop to a figure and transfers real bone weights onto it
     from the root figure via Daz's own Transfer Utility once run after load
     - see _build_mesh_prop's docstring for why this replaced an earlier
     conform_target-based approach that loaded fine but never actually
-    deformed with the root's pose. A single-mesh export is just the
+    deformed with the root's pose - and also does the material shader-class
+    fixup every export needs (see _material_fixup_body_lines' docstring),
+    combined into that same one script so there's only one companion file
+    to find and run instead of two. A single-mesh export is just the
     degenerate case with zero attachments (and no rig-transfer script, since
     there's nothing to transfer onto).
 
@@ -1774,16 +1864,20 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(duf, f, indent="\t")
 
-    fixup_script_path = os.path.splitext(filepath)[0] + "_fix_materials.dsa"
-    _write_material_fixup_script(materials_manifest_by_node, fixup_script_path)
     # Stashed after json.dump() so it can't leak into the written .duf file.
-    duf["_fixup_script"] = fixup_script_path
-
+    # One combined script when there's an attached-mesh rig transfer to do
+    # too, so the user only has to find and run ONE .dsa instead of two (see
+    # _write_combined_fixup_script) - otherwise just the material fixup,
+    # unchanged from before.
     if attached_props:
-        rig_transfer_script_path = os.path.splitext(filepath)[0] + "_rig_transfer.dsa"
-        _write_rig_transfer_script(
-            [prop["label"] for prop in attached_props], root_mesh.name, rig_transfer_script_path)
-        duf["_rig_transfer_script"] = rig_transfer_script_path
+        fixup_script_path = os.path.splitext(filepath)[0] + "_fixup.dsa"
+        _write_combined_fixup_script(
+            materials_manifest_by_node, [prop["label"] for prop in attached_props],
+            root_mesh.name, fixup_script_path)
+    else:
+        fixup_script_path = os.path.splitext(filepath)[0] + "_fix_materials.dsa"
+        _write_material_fixup_script(materials_manifest_by_node, fixup_script_path)
+    duf["_fixup_script"] = fixup_script_path
 
     return duf
 
