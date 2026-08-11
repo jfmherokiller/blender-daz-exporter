@@ -137,6 +137,26 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         description="How strongly each smoothing pass blends toward the neighbor average (0 = no effect, 1 = full blend)",
         default=0.5, min=0.0, max=1.0,
     )
+    root_mesh_name: StringProperty(
+        name="Root Mesh",
+        description=(
+            "Which selected mesh becomes the main posable figure. Every other mesh becomes a "
+            "separate attached figure conform_target-ed to it. Leave blank to use the first "
+            "mesh in the selection. Ignored when only one mesh is being exported"
+        ),
+        default="",
+    )
+    bake_textures: BoolProperty(
+        name="Bake Procedural Textures",
+        description=(
+            "Bake procedurally-fed material channels (Mix/AO/Noise node graphs) to flat "
+            "textures via Cycles. Usually more accurate, but can produce a flat, detail-less "
+            "result for materials mixing an image with a procedural Noise Texture on small/"
+            "thin mesh regions (e.g. a tail). Turn off to skip baking and reuse whatever real "
+            "image texture is upstream instead - less exact, but predictable"
+        ),
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context):
@@ -152,10 +172,13 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         kwargs = {
             "morph_smooth_iterations": self.morph_smooth_iterations,
             "morph_smooth_factor": self.morph_smooth_factor,
+            "bake_textures": self.bake_textures,
         }
         if self.export_as_clothing:
             kwargs["presentation_type"] = self.presentation_type or None
             kwargs["preferred_base"] = self.preferred_base or None
+        if len(mesh_objs) > 1 and self.root_mesh_name:
+            kwargs["root_mesh_name"] = self.root_mesh_name
 
         try:
             result = duf_export.export_duf(mesh_objs, armature_obj, self.filepath, **kwargs)
@@ -165,9 +188,12 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
 
         names = ", ".join(m.name for m in mesh_objs)
         fixup_script = result.get("_fixup_script")
+        rig_transfer_script = result.get("_rig_transfer_script")
         msg = f"Exported [{names}] -> {self.filepath}"
         if fixup_script:
             msg += f" (material fixup script: {fixup_script})"
+        if rig_transfer_script:
+            msg += f" (rig transfer script: {rig_transfer_script})"
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -177,6 +203,10 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         if self.export_as_clothing:
             layout.prop(self, "presentation_type")
             layout.prop(self, "preferred_base")
+        layout.separator()
+        layout.prop(self, "root_mesh_name")
+        layout.separator()
+        layout.prop(self, "bake_textures")
         layout.separator()
         layout.prop(self, "morph_smooth_iterations")
         if self.morph_smooth_iterations > 0:

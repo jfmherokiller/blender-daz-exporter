@@ -50,11 +50,27 @@ def _xyz_channels(prefix, label_prefix, values, minv=-10000.0, maxv=10000.0, ste
     return out
 
 
-def _bone_node_entry(bone_id, label, parent_id, center_point, end_point):
-    """One node_library entry for a bone (or the figure root when parent_id is None)."""
+def _bone_node_entry(bone_id, label, parent_id, center_point, end_point, name=None):
+    """One node_library entry for a bone (or the figure root when parent_id is None).
+
+    `name` (DSON's internal identifier field, distinct from `id`) defaults to
+    bone_id when not given. An attached mesh's independent skeleton copy
+    needs a prefixed, collision-free `id` (see _build_mesh_figure) but its
+    bones' `name` must stay the PLAIN, unprefixed bone name - confirmed by
+    inspecting a real shipped conforming asset ("High Tops Wearable" for
+    Genesis 8 Male): its bones' `name` fields are plain ("hip", "pelvis",
+    "lThighBend", matching the target figure's own bone names exactly), not
+    prefixed with the product name anywhere. Daz's conforming/"Fit To"
+    engine matches bones between the follower's independent skeleton copy
+    and the target's by this `name` field - prefixing it (as an earlier
+    version of this exporter did, to dodge id collisions) silently breaks
+    conforming: `conform_target` resolves fine and getFollowTarget() reads
+    back correctly, but posing the target does nothing at all, because the
+    engine never finds a same-named bone to mirror.
+    """
     entry = {
         "id": bone_id,
-        "name": bone_id,
+        "name": name or bone_id,
         "type": "bone" if parent_id else "figure",
         "label": label,
         "rotation_order": "XYZ",
@@ -70,6 +86,28 @@ def _bone_node_entry(bone_id, label, parent_id, center_point, end_point):
     if parent_id:
         entry["parent"] = f"#{parent_id}"
     return entry
+
+
+def _prop_node_entry(node_id, label, end_point=(0.0, 0.0, 1.0)):
+    """One node_library entry for a standalone static prop (type "node",
+    not "bone"/"figure" - no skeleton, no skin_binding). Sits at the scene
+    origin with identity transform since its geometry is already baked into
+    world/Daz space (see _build_geometry_and_uv's world_space=True)."""
+    return {
+        "id": node_id,
+        "name": node_id,
+        "type": "node",
+        "label": label,
+        "rotation_order": "XYZ",
+        "inherits_scale": True,
+        "center_point": _xyz_channels("Origin", "Origin", (0.0, 0.0, 0.0), step=0.01),
+        "end_point": _xyz_channels("End", "End", end_point, step=0.01),
+        "orientation": _xyz_channels("Orientation", "Orientation", [0.0, 0.0, 0.0], step=0.1),
+        "rotation": _xyz_channels("Rotate", "Rotate", [0.0, 0.0, 0.0], -180.0, 180.0, 0.5, True),
+        "translation": _xyz_channels("Translate", "Translate", [0.0, 0.0, 0.0], step=1.0),
+        "scale": _xyz_channels("Scale", "Scale", [1.0, 1.0, 1.0], -100.0, 100.0, 0.005),
+        "general_scale": _channel("scale", "float", "Scale", "Scale", 1.0, 0.0, 100.0, 0.005),
+    }
 
 
 def _safe_id(name):
@@ -108,7 +146,7 @@ def _expand_with_ancestors(names, armature_obj):
     return expanded
 
 
-def _walk_bones(armature_obj, figure_end_point, allowed_names=None):
+def _walk_bones(armature_obj, figure_end_point, allowed_names=None, root_label=None):
     """
     Yield (bone_id, label, parent_id_or_None, center_point_daz, end_point_daz)
     for the figure root followed by every bone, depth-first.
@@ -117,6 +155,10 @@ def _walk_bones(armature_obj, figure_end_point, allowed_names=None):
     _expand_with_ancestors), bones outside that set - and their entire
     subtree - are skipped entirely. Safe because an included bone's ancestors
     are always included too by construction, so no parent-chain gaps result.
+
+    root_label overrides the figure root's display label (default:
+    armature_obj.name) - used by _build_mesh_figure() so each mesh's own
+    independent skeleton copy is labeled after the MESH it belongs to.
 
     IMPORTANT: center_point and end_point are ABSOLUTE positions (in the
     Daz cm/Y-up space), NOT deltas relative to the parent or to the bone's
@@ -130,7 +172,7 @@ def _walk_bones(armature_obj, figure_end_point, allowed_names=None):
     live via daz_get_world_position/getWSPos before this was found and fixed.
     """
     figure_id = _safe_id(armature_obj.name)
-    yield (figure_id, armature_obj.name, None, [0.0, 0.0, 0.0], figure_end_point)
+    yield (figure_id, root_label or armature_obj.name, None, [0.0, 0.0, 0.0], figure_end_point)
 
     bones = armature_obj.data.bones
     roots = [b for b in bones if b.parent is None]
@@ -155,10 +197,21 @@ def _walk_bones(armature_obj, figure_end_point, allowed_names=None):
         yield from recurse(root, figure_id)
 
 
-def _build_geometry_and_uv(mesh_obj, geo_id, uv_id):
+def _build_geometry_and_uv(mesh_obj, geo_id, uv_id, world_space=False):
+    """world_space=True bakes mesh_obj.matrix_world into the exported vertex
+    positions - needed for a standalone prop node (see export_duf_prop),
+    which has no bone/figure transform of its own to place it. Rigged
+    figure meshes (the default, world_space=False) instead rely on the
+    project convention that the mesh object's own transform is identity and
+    its vertices already sit in the same space as the figure root node
+    (translation [0,0,0])."""
     mesh = mesh_obj.data
 
-    vertices = [to_daz_vec(v.co) for v in mesh.vertices]
+    if world_space:
+        mw = mesh_obj.matrix_world
+        vertices = [to_daz_vec(mw @ v.co) for v in mesh.vertices]
+    else:
+        vertices = [to_daz_vec(v.co) for v in mesh.vertices]
 
     material_names = [_safe_id(m.name) if m else "default" for m in mesh.materials] or ["default"]
     if not mesh.materials:
@@ -219,12 +272,22 @@ def _build_geometry_and_uv(mesh_obj, geo_id, uv_id):
     return geometry, uv_set, material_names
 
 
-def _build_skin_binding(mesh_obj, geo_id, figure_id, mod_id, bone_ids):
+def _build_skin_binding(mesh_obj, geo_id, figure_id, mod_id, bone_id_map):
+    """bone_id_map: {plain_safe_id(vertex_group_name): actual_node_library_id}.
+    Kept as a mapping rather than a flat set of valid ids because an
+    attached mesh's independent skeleton copy uses PREFIXED node_library
+    ids (e.g. "hoodie_chest") while its Blender vertex groups are still
+    named plainly ("chest") - looking those plain names up directly
+    against the prefixed id set silently finds no matches at all
+    (confirmed live: a DzSkinBinding modifier structurally attached but
+    getNumBoneBindings() read back 0). For the root mesh, plain name and
+    actual id are identical, so this degenerates to the old behavior."""
     mesh = mesh_obj.data
     group_index_to_bone = {}
     for vg in mesh_obj.vertex_groups:
-        bid = _safe_id(vg.name)
-        if bid in bone_ids:
+        plain = _safe_id(vg.name)
+        bid = bone_id_map.get(plain)
+        if bid is not None:
             group_index_to_bone[vg.index] = bid
 
     per_bone_weights = {bid: [] for bid in group_index_to_bone.values()}
@@ -319,14 +382,95 @@ def _resolve_image_file(image, out_dir, basename):
     return target if os.path.isfile(target) else None
 
 
+def _extract_alpha_channel(image, out_dir, basename):
+    """
+    Export just an Image's alpha channel as its own standalone grayscale
+    PNG (R=G=B=alpha, alpha=1) - for channels like Cutout Opacity that need
+    a genuine per-pixel mask image, not a reused copy of the full-color
+    texture the shader's Alpha input happens to trace back to.
+
+    This mirrors a technique already confirmed to work in a previous,
+    separate PMX-import project: save the alpha channel out to its own
+    image and wire it in as its own map, rather than pointing the cutout
+    channel at the same file used for color. Baking (via the EMIT-reroute
+    technique _bake_socket_to_image uses) was tried here first as the
+    general-purpose fallback and produces a mask that LOOKS correct when
+    inspected as a standalone image, but the corresponding real-render
+    result still came out wrong for this mesh (a large multi-material
+    fur-card mesh with heavily reused/overlapping UV space) - direct pixel
+    extraction sidesteps whatever is going wrong with baking on this kind
+    of geometry entirely, by not baking at all.
+    """
+    if image.channels < 4:
+        return None  # no alpha channel to extract
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, basename[:60] + "_alpha.png")
+
+    w, h = image.size
+    if w == 0 or h == 0:
+        return None
+
+    import numpy as np
+    src = np.empty(w * h * image.channels, dtype=np.float32)
+    image.pixels.foreach_get(src)
+    src = src.reshape((-1, image.channels))
+    alpha = src[:, 3]
+
+    out = np.ones((w * h, 4), dtype=np.float32)
+    out[:, 0] = alpha
+    out[:, 1] = alpha
+    out[:, 2] = alpha
+
+    new_img = bpy.data.images.new(basename[:60] + "_alpha", width=w, height=h, alpha=True)
+    try:
+        new_img.pixels.foreach_set(out.reshape(-1))
+        new_img.filepath_raw = target
+        new_img.file_format = "PNG"
+        new_img.save()
+    finally:
+        bpy.data.images.remove(new_img)
+    return target if os.path.isfile(target) else None
+
+
 def _direct_image(inp, out_dir, basename):
-    """If `inp` is fed by nothing but a single Image Texture node (directly, or
-    through one Normal Map node), return that image's filepath - cheap reuse,
-    no baking needed since there's no processing to resolve."""
+    """If `inp` is fed by nothing but a single Image Texture node (directly,
+    through one or more Reroute nodes, or through one Normal Map node),
+    return an appropriate image filepath - cheap reuse, no baking needed
+    since there's no processing to resolve.
+
+    Dispatches on which OUTPUT of the Image Texture node actually feeds
+    `inp`, traced through any Reroute passthroughs in between (confirmed
+    live: a real fur-card material's Alpha input is fed via exactly one
+    Reroute node straight from an Image Texture's Alpha output):
+    - "Color" output: reuse the file directly (_resolve_image_file) -
+      cheap and correct, this is the same pixel data either way.
+    - "Alpha" output: extract just the alpha channel as its own standalone
+      grayscale image (_extract_alpha_channel). Reusing the full-color file
+      here is wrong - Daz reads an image_file map on a scalar channel like
+      Cutout Opacity via the file's own luminance, not any alpha channel
+      embedded in it, and a colorful fur-card texture's luminance has
+      nothing to do with its actual transparency shape.
+    """
     if not inp.is_linked:
         return None
-    from_node = inp.links[0].from_node
+    link = inp.links[0]
+    from_node = link.from_node
+    from_socket = link.from_socket
+    depth = 0
+    while from_node.type == "REROUTE" and depth < 8:
+        reroute_input = from_node.inputs[0]
+        if not reroute_input.is_linked:
+            return None
+        link = reroute_input.links[0]
+        from_node = link.from_node
+        from_socket = link.from_socket
+        depth += 1
+
     if from_node.type == "TEX_IMAGE" and from_node.image:
+        if from_socket.name == "Alpha":
+            return _extract_alpha_channel(from_node.image, out_dir, basename)
+        if from_socket.name != "Color":
+            return None
         return _resolve_image_file(from_node.image, out_dir, basename)
     if from_node.type == "NORMAL_MAP":
         color_in = from_node.inputs.get("Color")
@@ -337,17 +481,21 @@ def _direct_image(inp, out_dir, basename):
     return None
 
 
-def _heuristic_upstream_image(socket, out_dir, basename, visited=None):
-    """
-    Fallback for when baking isn't available (see _bake_socket_to_image):
-    walk upstream through the node graph and return the first Image Texture
-    found anywhere feeding this socket, ignoring how it's actually combined
-    (Mix/ColorRamp/etc). Not correct for genuinely blended multi-texture
-    materials - may grab a mask or secondary layer instead of the intended
-    one - only used as a last resort.
-    """
-    if visited is None:
-        visited = set()
+_FACTOR_SOCKET_IDS = ("Fac", "Factor", "Factor_Float", "Factor_Vector")
+
+
+def _heuristic_upstream_image_search(socket, out_dir, basename, visited, skip_factor):
+    """Recursive worker for _heuristic_upstream_image. When skip_factor is
+    True, refuses to descend into a blend-weight input (the "Fac" input of a
+    legacy MixRGB node, or the "Factor_Float"/"Factor_Vector" duplicate
+    sockets of Blender 4.x's unified Mix node - both display as "Factor" in
+    the UI but only the identifier reliably tells them apart, same pitfall
+    as the hidden A/B duplicate sockets), usually fed by a mask/AO ColorRamp
+    rather than real color data, so a first pass can prefer genuine
+    color-carrying textures over masks reached via a shorter path. Also
+    skips disabled duplicate sockets (e.g. Factor_Vector when the node's
+    data_type is COLOR) since Blender 4.x's unified nodes keep every
+    data-type variant of a socket present but inert."""
     if not socket.is_linked:
         return None
     node = socket.links[0].from_node
@@ -357,10 +505,34 @@ def _heuristic_upstream_image(socket, out_dir, basename, visited=None):
     if node.type == "TEX_IMAGE" and node.image:
         return _resolve_image_file(node.image, out_dir, basename)
     for inp in node.inputs:
-        img = _heuristic_upstream_image(inp, out_dir, basename, visited)
+        if not inp.enabled:
+            continue
+        if skip_factor and inp.identifier in _FACTOR_SOCKET_IDS:
+            continue
+        img = _heuristic_upstream_image_search(inp, out_dir, basename, visited, skip_factor)
         if img:
             return img
     return None
+
+
+def _heuristic_upstream_image(socket, out_dir, basename):
+    """
+    Fallback for when baking isn't available (see _bake_socket_to_image):
+    walk upstream through the node graph and return an Image Texture found
+    anywhere feeding this socket, ignoring how it's actually combined
+    (Mix/ColorRamp/etc). Not correct for genuinely blended multi-texture
+    materials - only used as a last resort.
+
+    Two passes: first refusing to descend into Mix/MixRGB "Fac"/"Factor"
+    inputs (typically fed by a mask, e.g. an AO ColorRamp, not real color
+    data - confirmed live to otherwise grab a grayscale AO mask instead of
+    the actual colored texture one hop further away), then falling back to
+    an unrestricted search if that finds nothing.
+    """
+    img = _heuristic_upstream_image_search(socket, out_dir, basename, set(), skip_factor=True)
+    if img:
+        return img
+    return _heuristic_upstream_image_search(socket, out_dir, basename, set(), skip_factor=False)
 
 
 def _bake_socket_to_image(mesh_obj, mat, socket, out_dir, image_basename, size=1024):
@@ -492,7 +664,7 @@ def _find_socket(bsdf, aliases):
     return None
 
 
-def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix):
+def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
     """Map a Blender material's Principled BSDF inputs onto Iray Uber channel
     ids, baking any procedurally-fed (non-trivial) socket to a flat texture.
     Returns (diffuse_rgb[3], diffuse_image_or_None, {channel_id: (value_or_None, image_or_None)})."""
@@ -507,13 +679,34 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix):
     def resolve(inp, bake_name):
         """value_or_None, image_or_None for one socket - direct value, direct
         (unprocessed) texture reuse, or a fresh bake, in that priority order.
+
+        bake_textures=False skips the bake step entirely, going straight to
+        the heuristic upstream-image fallback - an escape hatch for
+        materials where baking produces a WRONG result rather than merely
+        an approximate one. Confirmed live: a material blending an AO map
+        with a procedural Noise Texture (Generated/3D-position-based, not
+        UV-based) baked to a flat, detail-less patch specifically on a
+        small/thin mesh region (a tail) while baking correctly everywhere
+        else on the same body - reproducible across repeated bakes, not a
+        caching fluke. The likely mechanism: the material's Overlay blend
+        mode is a no-op when the noise value it's blending against happens
+        to be near 0.5, which can happen when a small mesh region's full
+        3D extent falls within less than one wavelength of the noise
+        function. Root-causing that fully (e.g. isolating a bake to a
+        sub-mesh with its own tighter bounding box, changing what
+        "Generated" coordinates mean for it) is unsolved - this flag is the
+        pragmatic workaround: skip baking, fall back to whatever real
+        Image Texture is upstream instead, trading exact multi-layer
+        color/AO/noise fidelity for a predictable, non-broken result.
+
         If baking raises (some environments can't run bpy.ops.object.bake -
         e.g. confirmed non-functional when invoked through this project's
         Blender MCP scripting bridge specifically, "No valid selected
         objects" despite every Python-level selection/visibility check
         passing - looks like a context restriction in that execution path,
-        not a flaw in the baking logic itself), fall back to the heuristic
-        upstream-image search rather than aborting the whole export."""
+        not a flaw in the baking logic itself), also falls back to the
+        heuristic upstream-image search rather than aborting the whole
+        export."""
         if inp is None:
             return None, None
         if not inp.is_linked:
@@ -522,12 +715,13 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix):
         direct = _direct_image(inp, textures_dir, basename)
         if direct:
             return None, direct
-        try:
-            baked = _bake_socket_to_image(mesh_obj, mat, inp, textures_dir, basename)
-            if baked:
-                return None, baked
-        except RuntimeError:
-            pass
+        if bake_textures:
+            try:
+                baked = _bake_socket_to_image(mesh_obj, mat, inp, textures_dir, basename)
+                if baked:
+                    return None, baked
+            except RuntimeError:
+                pass
         return None, _heuristic_upstream_image(inp, textures_dir, basename)
 
     base_val, base_img = resolve(bsdf.inputs.get("Base Color"), "BaseColor")
@@ -550,21 +744,34 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix):
         if val is not None:
             overrides[channel_id] = (list(val[:3]) if channel_id == "Emission Color" else val, None)
         elif img:
-            overrides[channel_id] = (None, img)
+            # Iray Uber multiplies value * map - leaving value at None means
+            # the fixup script never calls setValue(), so the channel keeps
+            # whatever the stock Iray Uber Base preset default is. Confirmed
+            # live that default is 0 for "Glossy Roughness" (and likely
+            # other channels too), which multiplies a perfectly good baked
+            # map down to nothing - the surface renders mirror-smooth
+            # everywhere regardless of the map's actual content (confirmed:
+            # a real baked roughness map was present, isMapped() true, but
+            # the material still looked far too shiny). 1.0 is the neutral
+            # "let the map fully drive this channel" multiplier - same fix
+            # already applied to Base Color (-> white) and Normal Map
+            # (-> 1.0) above/below; this closes the gap for the rest.
+            emission_default = [1.0, 1.0, 1.0] if channel_id == "Emission Color" else 1.0
+            overrides[channel_id] = (emission_default, img)
 
     spec_inp = _find_socket(bsdf, _SPECULAR_ALIASES)
     val, img = resolve(spec_inp, "Specular")
     if val is not None:
         overrides["Glossy Reflectivity"] = (val, None)
     elif img:
-        overrides["Glossy Reflectivity"] = (None, img)
+        overrides["Glossy Reflectivity"] = (1.0, img)
 
     trans_inp = _find_socket(bsdf, _TRANSMISSION_ALIASES)
     val, img = resolve(trans_inp, "Transmission")
     if val is not None and val > 0:
         overrides["Refraction Weight"] = (val, None)
     elif img:
-        overrides["Refraction Weight"] = (None, img)
+        overrides["Refraction Weight"] = (1.0, img)
 
     normal_inp = bsdf.inputs.get("Normal")
     if normal_inp is not None and normal_inp.is_linked:
@@ -609,10 +816,15 @@ def _iray_channels_sparse(overrides):
     return channels
 
 
-def _build_materials(mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir):
+def _build_materials(mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures=True):
     """mesh_id prefixes every material id so multiple meshes' materials
     (e.g. two different meshes both having a slot literally named the same)
     can't collide in the shared file-wide id namespace.
+
+    bake_textures=False skips Cycles baking for procedurally-fed channels
+    entirely (see _iray_overrides' resolve() docstring) - an escape hatch
+    for materials where baking produces a wrong result rather than merely
+    an approximate one.
 
     Also returns materials_manifest: {group_name: {diffuse_rgb, diffuse_image,
     overrides}} - the raw per-material channel data needed by
@@ -627,7 +839,7 @@ def _build_materials(mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_
     for i, group_name in enumerate(material_names):
         mat = blender_mats[i] if (blender_mats and i < len(blender_mats)) else None
         mat_id = f"{mesh_id}_{group_name}_mat"
-        diffuse_rgb, diffuse_image, overrides = _iray_overrides(mat, mesh_obj, textures_dir, mat_id)
+        diffuse_rgb, diffuse_image, overrides = _iray_overrides(mat, mesh_obj, textures_dir, mat_id, bake_textures)
         materials_manifest[group_name] = {
             "diffuse_rgb": diffuse_rgb,
             "diffuse_image": diffuse_image,
@@ -848,24 +1060,21 @@ def _js_channel_value_snippet(prop_expr, value, image):
     return "\n".join(lines)
 
 
-def _write_material_fixup_script(node_label, materials_manifest_by_shape, script_path,
+def _write_material_fixup_script(materials_manifest_by_node, script_path,
                                   preset_path=_BUNDLED_UBER_BASE_PRESET):
     """
-    Write a standalone DazScript (.dsa) that upgrades every material zone on
-    `node_label` from the legacy DzDefaultMaterial our raw .duf merge produces
-    to a genuine DzUberIrayMaterial, then re-applies the diffuse/PBR channel
-    values and baked texture maps this exporter already computed.
+    Write a standalone DazScript (.dsa) that upgrades every material zone
+    across a set of scene nodes from the legacy DzDefaultMaterial our raw
+    .duf merge produces to genuine DzUberIrayMaterial, then re-applies the
+    diffuse/PBR channel values and baked texture maps this exporter already
+    computed.
 
-    materials_manifest_by_shape: a LIST of per-mesh manifest dicts (one per
-    mesh_objs entry, in the same order they were passed to export_duf - which
-    is also the order DzObject.getShape(i) exposes them in, confirmed live).
-    Deliberately a list, not one flat dict merged across meshes: a multi-mesh
-    collection export (e.g. selecting the Armature to export every rigged
-    mesh below it) can easily have two different meshes reuse the same
-    material-slot name (confirmed live on the fox: shape 0 "Body" and shape 5
-    "tounguefake" both have zones literally named "fox" and "HairClumps") - a
-    flat dict keyed by that name would silently let one mesh's channel data
-    clobber the other's.
+    materials_manifest_by_node: a list of (node_label, {group_name: {...}})
+    pairs, one per exported mesh/figure - every exported mesh is its own
+    separate scene node/figure with its own single shape (see
+    _build_mesh_figure), so unlike an earlier single-shared-node design,
+    there's no shape-index-switching or cross-mesh material-name collision
+    risk to handle here.
 
     WHY THIS EXISTS: describing a "studio_material_channels" block by hand in
     a merged .duf (what this exporter used to rely on exclusively) is not
@@ -877,25 +1086,9 @@ def _write_material_fixup_script(node_label, materials_manifest_by_shape, script
     a shader preset from Smart Content onto a figure). That path builds a
     native shader object instead of parsing one from raw JSON, but it also
     resets every channel to shader defaults - so step 2 re-applies our actual
-    values/maps through the live DzMaterial property API (setColorValue /
+    values/maps through the live DzMaterial property API (setFloatColorValue /
     setValue / setMap), which is confirmed to work uniformly across both
     color and plain numeric channels.
-
-    MULTI-SHAPE GOTCHA (confirmed live on a 6-mesh collection export): when
-    export_duf() combines several meshes onto one node (each mesh becomes its
-    own "geometry" on that single node/DzObject - see the "geometries" list
-    on the figure root's scene node), DzObject.getCurrentShape() only ever
-    returns shape index 0. Selecting the *node* and even explicitly
-    select()-ing every material across every shape still only promotes shape
-    0's materials to DzUberIrayMaterial when the preset is applied - the
-    other shapes are silently left as DzDefaultMaterial. The actual fix:
-    DzObject.getGeometryControl() is the LOD/shape-selector DzEnumProperty;
-    setting its value to shape index i BEFORE selecting materials and
-    applying the preset makes shape i "current", and only then does the
-    preset-apply (and the material selection) actually reach it. So this
-    script switches shapes one at a time via that control, fixing each
-    shape's materials while it's current, then restores index 0 at the end.
-    For a single-shape export this loop just runs once trivially.
 
     This script is meant to be run once, after the .duf it's paired with has
     been loaded/merged into the scene (e.g. via this project's `daz` MCP
@@ -911,32 +1104,25 @@ def _write_material_fixup_script(node_label, materials_manifest_by_shape, script
         "// zones to Iray Uber and restores their channel values/maps.",
         "// See DUF_EXPORT_NOTES.md 'Materials: shader-class fixup' for why this exists.",
         "(function(){",
-        f"    var node = Scene.findNodeByLabel({_js_str(node_label)});",
-        f"    if (!node) node = Scene.findNode({_js_str(node_label)});",
-        f"    if (!node) throw new Error(\"Node not found: \" + {_js_str(node_label)});",
-        "",
-        "    var obj = node.getObject();",
-        "    var numShapes = obj.getNumShapes();",
-        "    var ctrl = numShapes > 1 ? obj.getGeometryControl() : null;",
         f"    var presetPath = {_js_str(preset_path)};",
         "    var fixedZones = [];",
         "    var missingZones = [];",
     ]
 
-    for shape_index, manifest_dict in enumerate(materials_manifest_by_shape):
+    for node_label, manifest_dict in materials_manifest_by_node:
         lines.append("")
-        lines.append(f"    // --- shape {shape_index} ---")
+        lines.append(f"    // --- node {node_label!r} ---".replace("'", '"'))
         lines.append(f"    (function(){{")
-        lines.append(f"        var shapeIndex = {shape_index};")
-        lines.append("        if (shapeIndex >= numShapes) return;")
-        lines.append("        if (ctrl) ctrl.setValue(shapeIndex);")
-        lines.append("        var shape = obj.getShape(shapeIndex);")
+        lines.append(f"        var node = Scene.findNodeByLabel({_js_str(node_label)});")
+        lines.append(f"        if (!node) node = Scene.findNode({_js_str(node_label)});")
+        lines.append(f"        if (!node) {{ missingZones.push({_js_str(node_label)} + \":<node not found>\"); return; }}")
+        lines.append("        var shape = node.getObject().getCurrentShape();")
         lines.append("")
         lines.append("        Scene.selectAllNodes(false);")
         lines.append("        node.select(true);")
         lines.append("        for (var i = 0; i < shape.getNumMaterials(); i++) shape.getMaterial(i).select(true);")
         lines.append("        var presetOk = App.getContentMgr().openFile(presetPath, new DzFileIOSettings(), false);")
-        lines.append("        if (!presetOk) throw new Error(\"Failed to apply Iray Uber Base preset on shape \" + shapeIndex + \": \" + presetPath);")
+        lines.append("        if (!presetOk) throw new Error(\"Failed to apply Iray Uber Base preset on node \" + node.getLabel() + \": \" + presetPath);")
 
         for group_name, manifest in manifest_dict.items():
             overrides = manifest["overrides"]
@@ -976,11 +1162,7 @@ def _write_material_fixup_script(node_label, materials_manifest_by_shape, script
 
     lines.extend([
         "",
-        "    if (ctrl) ctrl.setValue(0);",  # restore, cosmetic
-        "",
         "    return {",
-        "        node: node.getLabel(),",
-        "        numShapes: numShapes,",
         "        fixedZones: fixedZones,",
         "        missingZones: missingZones",
         "    };",
@@ -993,24 +1175,292 @@ def _write_material_fixup_script(node_label, materials_manifest_by_shape, script
     return script_path
 
 
+def _build_mesh_figure(mesh_obj, armature_obj, textures_dir, is_root,
+                        morph_smooth_iterations, morph_smooth_factor, bake_textures=True):
+    """
+    Build a fully self-contained figure - its own pruned skeleton copy,
+    geometry, skin_binding, materials, and morphs - for ONE mesh. The
+    building block for export_duf()'s multi-figure output: every exported
+    mesh becomes a separate scene node this way, one designated the root
+    (is_root=True, keeps plain bone ids) and the rest attached as their own
+    independent conforming figures parented AND conform_target-ed to it.
+
+    Mirrors real multi-piece conforming Daz assets, confirmed by inspecting
+    two real shipped products directly (a "High Tops Wearable" for Genesis
+    8 Male, and an "Otter Tail" prop - both gzip-compressed .duf despite the
+    extension): each one's root figure carries its OWN full copy of the
+    target's skeleton (own "hip"/"pelvis"/etc bones - separate DzBone
+    objects from the target's), with a skin_binding modifier referencing
+    only its OWN bones. What actually makes it follow the target figure's
+    pose is the scene node's "conform_target" field (plus "parent") - a
+    DECLARATIVE DSON field. Live-validated using the real, unmodified High
+    Tops file: merged it onto a loaded Genesis 8 Male and posed the thigh -
+    the shoe moved correctly, zero script involved. (An earlier attempt at
+    achieving the same effect purely via a post-load script calling
+    node.setFollowTarget() registered the relationship but did NOT sync
+    bone rotations - conform_target is a different, and actually-effective,
+    mechanism.)
+
+    Bone `id`s for a non-root mesh are prefixed with its own mesh_id so its
+    independent skeleton copy can't collide with the root's (or another
+    attached mesh's) ids in the shared node_library - e.g. root gets plain
+    "chest", an attached "hoodie" mesh gets "hoodie_chest". Their `name`
+    fields, however, stay PLAIN/unprefixed (see _bone_node_entry's
+    docstring - conforming matches bones by `name`, and the real High Tops
+    file's bone names are never prefixed with the product name).
+
+    Returns a dict with everything export_duf() needs to splice this
+    figure's data into the combined file: node_entries (this figure's own
+    (bone_id, label, parent_id, center, end) tuples, ids already prefixed),
+    node_library, figure_id (this figure's own root bone id), geometry,
+    uv_set, geometry_instance, modifiers_lib/modifier_instances,
+    materials_lib/materials_scene/materials_manifest, and label.
+    """
+    mesh_id = _safe_id(mesh_obj.name)
+    allowed_names = _expand_with_ancestors(used_bone_names([mesh_obj], armature_obj), armature_obj)
+    bbox_max_z = max((v[2] for v in mesh_obj.bound_box), default=1.0)
+    figure_end = to_daz_vec((0.0, 0.0, bbox_max_z))
+
+    raw_entries = list(_walk_bones(armature_obj, figure_end, allowed_names, root_label=mesh_obj.name))
+    if is_root:
+        node_entries = raw_entries
+    else:
+        def prefix(bid):
+            return f"{mesh_id}_{bid}"
+        node_entries = [
+            (prefix(bid), label, (prefix(parent_id) if parent_id else None), center, end)
+            for (bid, label, parent_id, center, end) in raw_entries
+        ]
+
+    figure_id = node_entries[0][0]
+    # plain vertex-group-matchable bone name -> actual (possibly prefixed)
+    # node_library id. See _build_skin_binding's docstring for why this
+    # can't just be a flat set of the (possibly prefixed) ids.
+    bone_id_map = {raw[0]: entry[0] for raw, entry in zip(raw_entries[1:], node_entries[1:])}
+    node_library = [
+        _bone_node_entry(bid, label, parent_id, center, end, name=raw[0])
+        for (bid, label, parent_id, center, end), raw in zip(node_entries, raw_entries)
+    ]
+
+    geo_id = mesh_id + "Base"
+    uv_id = mesh_id + "UV"
+    mod_id = mesh_id + "SkinBinding"
+
+    def instance_id(lib_id):
+        return f"{lib_id}-1"
+
+    geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id)
+    skin_modifier = _build_skin_binding(mesh_obj, geo_id, figure_id, mod_id, bone_id_map)
+    mats_lib, mats_scene, materials_manifest = _build_materials(
+        mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
+    morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, instance_id(geo_id), mesh_id,
+                                              morph_smooth_iterations, morph_smooth_factor)
+
+    geometry_instance = {
+        "id": instance_id(geo_id), "url": f"#{geo_id}", "name": geometry["name"],
+        "label": mesh_obj.name, "type": "polygon_mesh",
+    }
+    modifier_instances = [{
+        "id": instance_id(mod_id),
+        "url": f"#{mod_id}",
+        # Parent to the GEOMETRY's own scene instance, not the figure/bone
+        # root's - confirmed against the real High Tops file: its
+        # SkinBinding modifier's scene-instance parent is "#HighTops-4"
+        # (the geometry's own nested instance id), not "#HighTops-3" (the
+        # figure/node's own instance id), even though both live "on" the
+        # same node. Matches the pattern morphs already use correctly.
+        "parent": f"#{instance_id(geo_id)}",
+    }] + morphs_scene
+
+    return {
+        "label": mesh_obj.name,
+        "node_entries": node_entries,
+        "node_library": node_library,
+        "figure_id": figure_id,
+        "geometry": geometry,
+        "uv_set": uv_set,
+        "geometry_instance": geometry_instance,
+        "modifiers_lib": [skin_modifier] + morphs_lib,
+        "modifier_instances": modifier_instances,
+        "materials_lib": mats_lib,
+        "materials_scene": mats_scene,
+        "materials_manifest": materials_manifest,
+    }
+
+
+def _build_mesh_prop(mesh_obj, textures_dir, morph_smooth_iterations, morph_smooth_factor,
+                      bake_textures=True):
+    """
+    Build a standalone PROP (geometry + materials + morphs, no
+    skeleton/skin_binding at all) for one attached mesh - replaces the old
+    independent-skeleton-copy + conform_target approach for every mesh
+    except the root. That approach loaded and resolved cleanly (conform_target
+    correctly registered a follow relationship, getFollowTarget() read back
+    right) but never actually deformed with the target figure's pose no
+    matter what was fixed about its DSON structure - see git history / prior
+    revisions of this file for that investigation.
+
+    Real deformation now comes from Daz's own weight-transfer engine instead
+    of a hand-authored one: export_duf() writes each attached mesh as a
+    prop via this function, then bundles a companion "_rig_transfer.dsa"
+    script (see _write_rig_transfer_script) that, once run after load,
+    calls DzFigure.convertPropToFigure() to promote this prop to a figure
+    and then DzTransferUtility.doTransfer() (setTransferBinding(true)) to
+    compute genuine proximity-projected bone weights against the root
+    figure's actual skeleton - confirmed live to produce real pose-following
+    deformation (bounding box changes shape under a pose change, not just a
+    rigid parent-follow) where conform_target produced zero movement.
+
+    mesh_obj must be at an identity object transform, in the same space as
+    the root mesh and armature_obj - same convention _build_mesh_figure
+    already relies on (see _build_geometry_and_uv's world_space=False
+    default). Not to be confused with export_duf_prop(), the standalone
+    single-prop entry point (which bakes world_space=True since it has no
+    figure-root convention to lean on) - kept separate rather than sharing
+    one function because their id/instance-suffix conventions differ (this
+    one must slot into export_duf()'s shared node/geometry/material
+    library lists without id collisions across multiple attached meshes).
+    """
+    mesh_id = _safe_id(mesh_obj.name)
+    geo_id = mesh_id + "Base"
+    uv_id = mesh_id + "UV"
+
+    bbox_max_z = max((v[2] for v in mesh_obj.bound_box), default=1.0)
+    end_point = to_daz_vec((0.0, 0.0, bbox_max_z))
+
+    geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id)
+    mats_lib, mats_scene, materials_manifest = _build_materials(
+        mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
+    morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, f"{geo_id}-1", mesh_id,
+                                              morph_smooth_iterations, morph_smooth_factor)
+
+    node_id = mesh_id
+    node_entry = _prop_node_entry(node_id, mesh_obj.name, end_point)
+    geometry_instance = {
+        "id": f"{geo_id}-1", "url": f"#{geo_id}", "name": geometry["name"],
+        "label": mesh_obj.name, "type": "polygon_mesh",
+    }
+
+    return {
+        "label": mesh_obj.name,
+        "node_id": node_id,
+        "node_entry": node_entry,
+        "geometry": geometry,
+        "uv_set": uv_set,
+        "geometry_instance": geometry_instance,
+        "modifiers_lib": morphs_lib,
+        "modifier_instances": morphs_scene,
+        "materials_lib": mats_lib,
+        "materials_scene": mats_scene,
+        "materials_manifest": materials_manifest,
+    }
+
+
+def _write_rig_transfer_script(attached_mesh_labels, root_label, script_path):
+    """
+    Write a standalone DazScript (.dsa) that promotes every attached-mesh
+    PROP (see _build_mesh_prop) to a real figure and transfers genuine bone
+    weights onto it from the root figure, via Daz's own Transfer Utility -
+    see _build_mesh_prop's docstring for why this replaces the old
+    conform_target approach. Meant to run once, after the .duf is loaded and
+    (if applicable) after the material fixup script - order between those
+    two doesn't matter, they touch disjoint state.
+
+    Each attached mesh gets its own throwaway root bone name
+    ("<mesh_id>_root") to convert around - doesn't need to mean anything,
+    DzTransferUtility's projected weights are what actually end up driving
+    deformation, not this bone's placement.
+    """
+    lines = [
+        "// Auto-generated by blender_daz_exporter - promotes each attached",
+        "// mesh prop to a figure and transfers real bone weights onto it",
+        "// from the root figure via Daz's Transfer Utility.",
+        "// See DUF_EXPORT_NOTES.md 'Attached-mesh rigging: Transfer Utility'",
+        "// for why this replaced the old conform_target approach.",
+        "(function(){",
+        f"    var rootLabel = {_js_str(root_label)};",
+        "    var root = Scene.findNodeByLabel(rootLabel);",
+        "    var transferred = [];",
+        "    var missing = [];",
+        "    if (!root) { missing.push(rootLabel + \":<root not found>\"); return {transferred: transferred, missing: missing}; }",
+        "",
+        "    var attachedLabels = [" + ", ".join(_js_str(lbl) for lbl in attached_mesh_labels) + "];",
+        "    for (var i = 0; i < attachedLabels.length; i++) {",
+        "        var label = attachedLabels[i];",
+        "        var propNode = Scene.findNodeByLabel(label);",
+        "        if (!propNode) { missing.push(label + \":<node not found>\"); continue; }",
+        "",
+        "        var rootBoneName = label.replace(/[^A-Za-z0-9_]/g, '_') + '_root';",
+        "        var newFig = new DzFigure();",
+        "        var converted = newFig.convertPropToFigure(propNode, rootBoneName, false, false);",
+        "        if (!converted) { missing.push(label + \":<convertPropToFigure failed>\"); continue; }",
+        "",
+        "        var xfer = new DzTransferUtility();",
+        "        xfer.setSource(root);",
+        "        xfer.setTarget(converted);",
+        "        xfer.setTransferBinding(true);",
+        "        xfer.setTransferUVs(false);",
+        "        xfer.setTransferMorphs(false);",
+        "        xfer.setFitToFigure(true);",
+        "        xfer.setParentToFigure(true);",
+        "        xfer.setMergeHierarchies(false);",
+        "        var ok = xfer.doTransfer();",
+        "        if (ok) { transferred.push(label); } else { missing.push(label + \":<doTransfer failed>\"); }",
+        "    }",
+        "",
+        "    return {transferred: transferred, missing: missing};",
+        "})();",
+    ]
+    script_text = "\n".join(lines)
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(script_text)
+    return script_path
+
+
 def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
                 presentation_type=None, preferred_base=None,
-                morph_smooth_iterations=2, morph_smooth_factor=0.5):
+                morph_smooth_iterations=2, morph_smooth_factor=0.5,
+                root_mesh_name=None, bake_textures=True):
     """
     Export one or more meshes (all rigged to `armature_obj` via vertex groups
-    matching bone names) as a single self-contained Daz Studio native .duf
-    scene file - one Figure with one geometry + skin_binding per mesh.
+    matching bone names) as a self-contained Daz Studio native .duf scene
+    file.
 
     mesh_objs: a single mesh Object, or a list of mesh Objects.
 
-    The skeleton written is pruned to only the bones actually referenced by
-    a vertex group across mesh_objs (plus their ancestors) - mirrors how
-    real Daz garment assets ship a reduced skeleton rather than the full
-    character rig. Pass presentation_type (e.g. "Follower/Wardrobe/Top") and
-    preferred_base (e.g. "/MyFox/Body") to mark the export as a conforming
-    clothing item Daz's "Fit to" feature can target, instead of a standalone
-    figure - matches the real-asset convention (confirmed against a shipped
-    Daz clothing product in this session).
+    bake_textures=False skips Cycles baking for procedurally-fed material
+    channels entirely, going straight to reusing whatever real Image
+    Texture is upstream instead (see _iray_overrides' resolve() docstring
+    for the full story). Baking is usually the more ACCURATE choice
+    (correctly flattens Mix/AO/ColorRamp chains into a texture), but it can
+    produce a flatly WRONG result for materials combining an image with a
+    procedural Noise Texture on small/thin mesh regions (confirmed live: a
+    tail, baked repeatedly, reproducibly came out as a flat solid-color
+    patch instead of showing the material's real fine-grain detail).
+    Turning this off trades exact multi-layer fidelity for a predictable,
+    non-broken result when baking is doing more harm than good.
+
+    ARCHITECTURE: one mesh is the ROOT figure - its own geometry + a full
+    skeleton copy, i.e. what you'd actually pose (root_mesh_name picks
+    which one, must match one of mesh_objs' .name; defaults to mesh_objs[0]
+    if not given). Every OTHER mesh is exported as a standalone PROP (see
+    _build_mesh_prop) - geometry + materials + morphs, no skeleton/
+    skin_binding. A companion "_rig_transfer.dsa" script (see
+    _write_rig_transfer_script, path returned as duf["_rig_transfer_script"])
+    promotes each prop to a figure and transfers real bone weights onto it
+    from the root figure via Daz's own Transfer Utility once run after load
+    - see _build_mesh_prop's docstring for why this replaced an earlier
+    conform_target-based approach that loaded fine but never actually
+    deformed with the root's pose. A single-mesh export is just the
+    degenerate case with zero attachments (and no rig-transfer script, since
+    there's nothing to transfer onto).
+
+    Pass presentation_type (e.g. "Follower/Wardrobe/Top") and preferred_base
+    (e.g. "/MyFox/Body") to mark the ROOT figure as conforming clothing
+    Daz's own "Fit to" feature can target from an externally-loaded body,
+    instead of a standalone figure. This is orthogonal to the attached-mesh
+    conform_target above: it's for when the whole export (root + its
+    attachments) is itself meant to be worn by something else.
 
     Shape keys export as DSON morphs with their deltas smoothed
     (morph_smooth_iterations/morph_smooth_factor - see _smooth_sparse_deltas)
@@ -1030,35 +1480,16 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
     if armature_obj.type != "ARMATURE":
         raise ValueError("armature_obj must be an ARMATURE object")
 
-    asset_name = asset_name or mesh_objs[0].name
+    if root_mesh_name:
+        matches = [m for m in mesh_objs if m.name == root_mesh_name]
+        if not matches:
+            raise ValueError(f"root_mesh_name {root_mesh_name!r} not found among the meshes being exported")
+        root_mesh = matches[0]
+    else:
+        root_mesh = mesh_objs[0]
+    attached_meshes = [m for m in mesh_objs if m is not root_mesh]
 
-    allowed_names = _expand_with_ancestors(used_bone_names(mesh_objs, armature_obj), armature_obj)
-
-    bbox_max_z = max((v[2] for mesh_obj in mesh_objs for v in mesh_obj.bound_box), default=1.0)
-    figure_end = to_daz_vec((0.0, 0.0, bbox_max_z))
-
-    node_entries = list(_walk_bones(armature_obj, figure_end, allowed_names))
-    figure_id = node_entries[0][0]
-    bone_ids = {e[0] for e in node_entries[1:]}
-
-    node_library = [
-        _bone_node_entry(bid, label, parent_id, center, end)
-        for (bid, label, parent_id, center, end) in node_entries
-    ]
-
-    geometries = []
-    uv_sets = []
-    all_modifiers = []
-    materials_lib = []
-    materials_scene = []
-    geometry_instances = []  # for the figure root's scene "geometries" list
-    modifier_instances = []
-    # One {group_name: {diffuse_rgb, diffuse_image, overrides}} dict per mesh,
-    # in mesh_objs order - matches DzObject.getShape(i) order 1:1 (confirmed
-    # live). Kept as a list, NOT merged into one flat dict, because different
-    # meshes can reuse the same material-slot name (see
-    # _write_material_fixup_script's docstring for why that matters).
-    materials_manifest_by_shape = []
+    asset_name = asset_name or root_mesh.name
 
     # Baked/complex-material textures land next to the export file, matching
     # how the reference Blender-to-Daz plugin bakes "simplified texture maps".
@@ -1069,39 +1500,30 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
         # See long comment on scene_nodes below for why this suffix exists.
         return f"{lib_id}-1"
 
-    for mesh_obj in mesh_objs:
-        mesh_id = _safe_id(mesh_obj.name)
-        geo_id = mesh_id + "Base"
-        uv_id = mesh_id + "UV"
-        mod_id = mesh_id + "SkinBinding"
+    root_figure = _build_mesh_figure(root_mesh, armature_obj, textures_dir, True,
+                                      morph_smooth_iterations, morph_smooth_factor, bake_textures)
+    attached_props = [
+        _build_mesh_prop(m, textures_dir, morph_smooth_iterations, morph_smooth_factor, bake_textures)
+        for m in attached_meshes
+    ]
 
-        geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id)
-        skin_modifier = _build_skin_binding(mesh_obj, geo_id, figure_id, mod_id, bone_ids)
-        mats_lib, mats_scene, mesh_materials_manifest = _build_materials(
-            mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir)
-        materials_manifest_by_shape.append(mesh_materials_manifest)
-        morphs_lib, morphs_scene = _build_morphs(mesh_obj, geo_id, instance_id(geo_id), mesh_id,
-                                                  morph_smooth_iterations, morph_smooth_factor)
-
-        geometries.append(geometry)
-        uv_sets.append(uv_set)
-        all_modifiers.append(skin_modifier)
-        all_modifiers.extend(morphs_lib)
-        materials_lib.extend(mats_lib)
-        materials_scene.extend(mats_scene)
-
-        geometry_instances.append({
-            "id": instance_id(geo_id), "url": f"#{geo_id}", "name": geometry["name"],
-            "label": mesh_obj.name, "type": "polygon_mesh",
-        })
-        modifier_instances.append({
-            "id": instance_id(mod_id),
-            "url": f"#{mod_id}",
-            "parent": f"#{instance_id(figure_id)}",
-        })
-        # Morphs use no scene-level "parent" (see _build_morphs docstring) -
-        # just the bare {id, url} instance real product files use.
-        modifier_instances.extend(morphs_scene)
+    node_library = list(root_figure["node_library"])
+    geometries = [root_figure["geometry"]]
+    uv_sets = [root_figure["uv_set"]]
+    all_modifiers = list(root_figure["modifiers_lib"])
+    materials_lib = list(root_figure["materials_lib"])
+    materials_scene = list(root_figure["materials_scene"])
+    modifier_instances = list(root_figure["modifier_instances"])
+    materials_manifest_by_node = [(root_figure["label"], root_figure["materials_manifest"])]
+    for prop in attached_props:
+        node_library.append(prop["node_entry"])
+        geometries.append(prop["geometry"])
+        uv_sets.append(prop["uv_set"])
+        all_modifiers.extend(prop["modifiers_lib"])
+        materials_lib.extend(prop["materials_lib"])
+        materials_scene.extend(prop["materials_scene"])
+        modifier_instances.extend(prop["modifier_instances"])
+        materials_manifest_by_node.append((prop["label"], prop["materials_manifest"]))
 
     # Scene-section objects are INSTANCES of library-section definitions and
     # need their own ids distinct from the library id they instance ("url"
@@ -1112,32 +1534,45 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
     # error (confirmed live). Suffix every scene-instance id with "-1",
     # matching the convention Daz's own exporter uses for material instances
     # (e.g. "bearTongue-1").
+    root_figure_root_instance_id = instance_id(root_figure["figure_id"])
     scene_nodes = []
-    for i, (bid, label, parent_id, _center, _end) in enumerate(node_entries):
+    for i, (bid, label, parent_id, _center, _end) in enumerate(root_figure["node_entries"]):
         n = {"id": instance_id(bid), "url": f"#{bid}", "name": bid, "label": label}
         if parent_id:
             # Node_library "parent" only defines the reusable prototype's
-            # default; the SCENE graph is actually wired by this instance-level
-            # "parent" field (confirmed against a real Daz-authored .duf),
-            # and it must point at the PARENT's scene-instance id, not its
-            # library id.
+            # default; the SCENE graph is actually wired by this
+            # instance-level "parent" field (confirmed against a real
+            # Daz-authored .duf), and it must point at the PARENT's
+            # scene-instance id, not its library id.
             n["parent"] = f"#{instance_id(parent_id)}"
         if i == 0:
-            n["geometries"] = geometry_instances
+            n["geometries"] = [root_figure["geometry_instance"]]
+        scene_nodes.append(n)
+    for prop in attached_props:
+        # Parented to the root purely as a sane default so it's positioned
+        # sensibly if the companion rig-transfer script hasn't been run yet -
+        # DzTransferUtility's setParentToFigure(true) re-parents it for real
+        # once that script runs (see _write_rig_transfer_script).
+        n = {
+            "id": instance_id(prop["node_id"]), "url": f"#{prop['node_id']}",
+            "name": prop["node_id"], "label": prop["label"],
+            "parent": f"#{root_figure_root_instance_id}",
+            "geometries": [prop["geometry_instance"]],
+        }
         scene_nodes.append(n)
 
-    figure_node_entry = node_library[0]
+    root_node_entry = root_figure["node_library"][0]
     if presentation_type:
         # Matches the real-asset convention for marking something as
         # conforming clothing (e.g. "Follower/Wardrobe/Top") vs. a standalone
         # figure/prop, confirmed against a shipped Daz clothing product.
-        figure_node_entry["presentation"] = {
+        root_node_entry["presentation"] = {
             "type": presentation_type,
             "label": "", "description": "", "icon_large": "",
             "colors": [[0.35, 0.35, 0.35], [1, 1, 1]],
         }
         if preferred_base:
-            figure_node_entry["presentation"]["preferred_base"] = preferred_base
+            root_node_entry["presentation"]["preferred_base"] = preferred_base
 
     duf = {
         "file_version": "0.6.0.0",
@@ -1163,8 +1598,104 @@ def export_duf(mesh_objs, armature_obj, filepath, asset_name=None,
         json.dump(duf, f, indent="\t")
 
     fixup_script_path = os.path.splitext(filepath)[0] + "_fix_materials.dsa"
-    _write_material_fixup_script(armature_obj.name, materials_manifest_by_shape, fixup_script_path)
+    _write_material_fixup_script(materials_manifest_by_node, fixup_script_path)
     # Stashed after json.dump() so it can't leak into the written .duf file.
+    duf["_fixup_script"] = fixup_script_path
+
+    if attached_props:
+        rig_transfer_script_path = os.path.splitext(filepath)[0] + "_rig_transfer.dsa"
+        _write_rig_transfer_script(
+            [prop["label"] for prop in attached_props], root_mesh.name, rig_transfer_script_path)
+        duf["_rig_transfer_script"] = rig_transfer_script_path
+
+    return duf
+
+
+def export_duf_prop(mesh_obj, filepath, asset_name=None, bake_textures=True):
+    """
+    Export a single mesh as a standalone static DSON PROP - geometry and
+    materials only, no skeleton/skin_binding at all (unlike export_duf's
+    figures). Meant as the source for Daz's own Transfer Utility workflow
+    instead of this project's hand-authored conform_target/skin_binding
+    approach: load this prop, use DzFigure.convertPropToFigure() to promote
+    it to a figure, then run DzTransferUtility (setSource = the posable
+    body figure, setTarget = this new figure, setTransferBinding(true)) to
+    let Daz itself compute real proximity-projected bone weights. The
+    conform_target approach never got attached meshes to actually deform
+    with the target's pose (see _build_mesh_figure's docstring for that
+    investigation); this sidesteps it entirely by leaning on Daz's own
+    weight-transfer engine instead of describing one by hand in DSON.
+
+    Also sidesteps Daz's interactive "OBJ Import Options" dialog (which
+    demands a manual scale/axis setup per import and has no scriptable
+    silent equivalent) - a merged .duf loads with no dialog at all, same as
+    every other file this exporter produces, and vertices are written
+    already in Daz cm/Y-up space so the scale is always correct.
+
+    Geometry is baked in WORLD space (mesh_obj.matrix_world), unlike
+    export_duf's figure meshes which assume an identity object transform -
+    a standalone prop has no bone/figure transform to place it otherwise.
+    """
+    if mesh_obj.type != "MESH":
+        raise ValueError(f"{mesh_obj.name} is not a MESH object")
+
+    asset_name = asset_name or mesh_obj.name
+    mesh_id = _safe_id(mesh_obj.name)
+
+    textures_dir = os.path.join(os.path.dirname(os.path.abspath(filepath)),
+                                 _safe_id(asset_name) + "_textures")
+
+    geo_id = mesh_id + "Base"
+    uv_id = mesh_id + "UV"
+
+    bbox_max_z = max((v[2] for v in mesh_obj.bound_box), default=1.0)
+    end_point = to_daz_vec((0.0, 0.0, bbox_max_z))
+
+    geometry, uv_set, material_names = _build_geometry_and_uv(mesh_obj, geo_id, uv_id, world_space=True)
+    mats_lib, mats_scene, materials_manifest = _build_materials(
+        mesh_obj, mesh_id, geo_id, uv_id, material_names, textures_dir, bake_textures)
+
+    node_id = mesh_id
+    node_entry = _prop_node_entry(node_id, mesh_obj.name, end_point)
+
+    def instance_id(lib_id):
+        return f"{lib_id}-1"
+
+    geometry_instance = {
+        "id": instance_id(geo_id), "url": f"#{geo_id}", "name": geometry["name"],
+        "label": mesh_obj.name, "type": "polygon_mesh",
+    }
+    scene_node = {
+        "id": instance_id(node_id), "url": f"#{node_id}", "name": node_id,
+        "label": mesh_obj.name,
+        "geometries": [geometry_instance],
+    }
+
+    duf = {
+        "file_version": "0.6.0.0",
+        "asset_info": {
+            "id": f"/{asset_name}.duf",
+            "type": "prop",
+            "contributor": {"author": "Blender DUF Exporter", "email": "", "website": ""},
+            "revision": "1.0",
+        },
+        "node_library": [node_entry],
+        "geometry_library": [geometry],
+        "uv_set_library": [uv_set],
+        "material_library": mats_lib,
+        "modifier_library": [],
+        "scene": {
+            "nodes": [scene_node],
+            "modifiers": [],
+            "materials": mats_scene,
+        },
+    }
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(duf, f, indent="\t")
+
+    fixup_script_path = os.path.splitext(filepath)[0] + "_fix_materials.dsa"
+    _write_material_fixup_script([(mesh_obj.name, materials_manifest)], fixup_script_path)
     duf["_fixup_script"] = fixup_script_path
 
     return duf
