@@ -8,23 +8,43 @@ AIHelpers/plugins/daz/skills/daz-dim-packaging/SKILL.md for the full schema
 this follows).
 
 Only concerned with repackaging what duf_export.py already produced - does
-not touch DUF/DSON generation itself. The one real surgery this module does
-is rewriting the in-memory duf dict's "image_file" fields from the absolute
-local-disk paths duf_export writes (correct for loading straight from the
-export folder, but meaningless once DIM installs the zip's contents to some
-other Content Library path) to content-library-root-relative paths
-("/Runtime/Textures/<Vendor>/<Product>/<file>") matching where this module
-physically stages the same texture files under Content/Runtime/Textures/ -
-and equivalently for the companion fixup script's bundled Iray Uber Base
-preset path, which duf_export.py otherwise hardcodes as an absolute path to
-this addon's own installed assets/ folder (only valid on the machine the
-addon itself is installed on).
+not touch DUF/DSON generation itself. The real surgery this module does:
+
+- Rewrites the in-memory duf dict's "image_file" fields from the absolute
+  local-disk paths duf_export writes (correct for loading straight from the
+  export folder, but meaningless once DIM installs the zip's contents to
+  some other Content Library path) to content-library-root-relative paths
+  ("/Runtime/Textures/<Vendor>/<Product>/<file>") matching where this module
+  physically stages the same texture files under Content/Runtime/Textures/.
+  This form of path (leading "/", resolved against registered Content
+  Directories) is only meaningful to Daz's own DSON scene-loading code - see
+  the next point for why the fixup .dsa script can't use the same trick.
+
+- Rewrites the companion fixup .dsa script's embedded absolute local-disk
+  paths - both the bundled Iray Uber Base preset path (which duf_export.py
+  hardcodes as an absolute path to this addon's own installed assets/
+  folder, only valid on the machine the addon itself is installed on) and
+  every texture setMap() call - into calls to a small JS helper injected at
+  the top of the script, which resolves a Content/-relative path to a real
+  absolute one AT RUNTIME by walking up from the script's own installed
+  location (getScriptFileName()). This is NOT the same "/Runtime/..."
+  leading-slash trick used for image_file above - live-confirmed that
+  DzMaterial.setMap()/DzContentMgr.openFile() do NOT resolve that style of
+  path against registered Content Directories the way DSON's own
+  image_file reference does (a real installed file at a real Content
+  Directory path still fails to resolve), so the fixup script needs its own
+  distinct, actually-working mechanism. See _content_relative_resolver_js
+  and _rewrite_fixup_script_paths for the mechanism, and TASKS.md for how
+  this was found (a live DIM-install reproduction: textures/shader failed
+  to load post-install even though the raw .duf's image_file paths and the
+  physically staged files were both correct).
 """
 import copy
 import json
 import os
 import pathlib
 import random
+import re
 import shutil
 import tempfile
 import uuid
@@ -70,22 +90,80 @@ def _collect_and_rewrite_images(duf, dest_root_prefix):
     return new_duf, copies
 
 
-def _rewrite_fixup_preset_path(script_text, new_preset_path):
-    """Swap the fixup script's embedded absolute local preset path for a
-    content-library-root-relative one pointing at the copy this module
-    stages under Content/Runtime/Support/ - see module docstring. The
-    original is embedded via json.dumps() (see duf_export._js_str), so
-    matching on that exact literal (rather than a looser path substring) is
-    the reliable way to find and replace it regardless of OS path
-    separators."""
-    old_literal = json.dumps(duf_export._BUNDLED_UBER_BASE_PRESET)
-    new_literal = json.dumps(new_preset_path)
-    if old_literal not in script_text:
+def _content_relative_resolver_js(depth):
+    """JS helper injected once into the fixup script: resolves a
+    Content/-relative path (e.g. "Runtime/Support/.../Foo.duf") to a real
+    absolute filesystem path AT RUNTIME, by walking up from the fixup
+    script's own installed location (getScriptFileName()) rather than
+    baking any path in ahead of time.
+
+    Necessary because DzMaterial.setMap()/DzContentMgr.openFile() do NOT
+    resolve a leading-slash "/Runtime/..." content-root-relative path
+    against registered Content Directories the way a DSON "image_file"
+    reference does internally - live-confirmed: DzFile("/Runtime/...").
+    exists() is false even when the file is genuinely present under a real
+    registered content directory (openFile() on that same string then fails
+    outright, "Failed to apply Iray Uber Base preset..."). And the real
+    install location is unknown until DIM actually installs the zip
+    somewhere, so no absolute path can be baked in ahead of time either -
+    this is what actually broke texture/preset loading after a real DIM
+    install (see TASKS.md).
+
+    `depth` is how many directory levels separate the fixup script's own
+    folder (Content/<content_folder>/<vendor>/<product>/) from Content/
+    itself - computed by the caller from the actual content_folder/vendor/
+    product path segments, not assumed fixed, since content_folder can
+    itself contain slashes (e.g. real Daz content folders like "Shader
+    Presets/Iray").
+    """
+    return (
+        "    function __dazDimContentPath(relPath) {\n"
+        "        var dir = new DzDir(new DzFile(getScriptFileName()).path());\n"
+        f"        for (var __dazDimUp = 0; __dazDimUp < {depth}; __dazDimUp++) {{ dir.cdUp(); }}\n"
+        "        return dir.filePath(relPath);\n"
+        "    }\n"
+    )
+
+
+def _rewrite_fixup_script_paths(script_text, image_copies, preset_content_rel_path, depth):
+    """Rewrites every absolute local-disk path the fixup script currently
+    embeds - the bundled Iray Uber Base preset path, and every texture
+    setMap() call - into a call to the runtime path-resolving helper above,
+    and injects that helper's definition once. Both categories of path are
+    embedded via json.dumps() (see duf_export._js_str), so matching on that
+    exact literal (rather than a looser path substring) is the reliable way
+    to find and replace them regardless of OS path separators.
+
+    image_copies is the same {source_abs_path: content_root_relative_path}
+    mapping _collect_and_rewrite_images already built for rewriting the raw
+    .duf's own "image_file" fields - the fixup script's setMap() calls
+    reference the exact same source paths (both are derived from the same
+    _iray_overrides() output), so it doubles as the substitution table here
+    with no separate bookkeeping needed.
+    """
+    old_preset_literal = json.dumps(duf_export._BUNDLED_UBER_BASE_PRESET)
+    if old_preset_literal not in script_text:
         raise ValueError(
             "Fixup script does not contain the expected bundled preset path literal - "
             "was it generated with a non-default preset_path?"
         )
-    return script_text.replace(old_literal, new_literal)
+    new_preset_expr = f"__dazDimContentPath({json.dumps(preset_content_rel_path)})"
+    script_text = script_text.replace(f"var presetPath = {old_preset_literal};",
+                                       f"var presetPath = {new_preset_expr};")
+
+    for src, dest_rel in image_copies.items():
+        old_map_literal = json.dumps(src)
+        new_map_expr = f"__dazDimContentPath({json.dumps(dest_rel.lstrip('/'))})"
+        script_text = script_text.replace(f".setMap({old_map_literal})",
+                                           f".setMap({new_map_expr})")
+
+    if re.search(r'\.setMap\(\s*"[A-Za-z]:/', script_text):
+        raise ValueError(
+            "Fixup script still has a setMap() call pointing at a raw local-disk path after "
+            "rewriting - image_copies is missing an entry for it"
+        )
+
+    return script_text.replace("(function(){\n", "(function(){\n" + _content_relative_resolver_js(depth), 1)
 
 
 def _manifest_dsx(content_root, global_id):
@@ -189,8 +267,14 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     with open(fixup_script_path, "r", encoding="utf-8") as f:
         fixup_text = f.read()
     support_prefix = "Runtime/Support/BlenderDUFExporter"
-    new_preset_path = f"/{support_prefix}/IrayUberBase.duf"
-    fixup_text = _rewrite_fixup_preset_path(fixup_text, new_preset_path)
+    preset_content_rel_path = f"{support_prefix}/IrayUberBase.duf"
+    # How many directory levels separate the fixup script's own staged
+    # folder (Content/<content_folder>/<vendor>/<product>/) from Content/
+    # itself - content_folder can itself contain slashes (real Daz content
+    # folders sometimes do, e.g. "Shader Presets/Iray"), so this is computed
+    # from the actual path segments rather than assumed to always be 3.
+    depth = len([seg for seg in f"{content_folder}/{vendor}/{product}".split("/") if seg])
+    fixup_text = _rewrite_fixup_script_paths(fixup_text, image_copies, preset_content_rel_path, depth)
 
     global_id = _resolve_global_id(global_id)
     product_num_id = _resolve_product_num_id(product_num_id)

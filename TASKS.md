@@ -6,6 +6,42 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## In progress / next up
 
+- [x] **Fix: textures/shader failed to load after a real DIM install** — root-caused and fixed via
+  a real live-Daz-Studio reproduction (not just code inspection). Symptom: after installing a
+  built DIM zip, the material stayed `DzDefaultMaterial` and threw
+  `"Failed to apply Iray Uber Base preset..."` when the companion fixup `.dsa` was run.
+  Root cause: `dim_package.py` rewrote the fixup script's bundled-preset path to a
+  content-root-relative string (`/Runtime/Support/BlenderDUFExporter/IrayUberBase.duf`), the same
+  style used for DSON `image_file` references — but that style only resolves via Daz's *own*
+  DSON scene-loading code. `DzContentMgr.openFile()`/`DzMaterial.setMap()` do **not** resolve it
+  the same way — confirmed live: `DzFile("/Runtime/...").exists()` is `false` even when the file
+  is genuinely present under a real registered Content Directory. Worse, every texture `setMap()`
+  call in the fixup script was never rewritten at all — it still pointed at the exporting
+  machine's original absolute local-disk path, meaningless once DIM installs elsewhere.
+  Fix: `dim_package.py` now injects a small JS helper (`_content_relative_resolver_js`) at the top
+  of the fixup script that resolves a `Content/`-relative path to a real absolute one **at
+  runtime**, by walking up from the script's own installed location via
+  `DzFile(getScriptFileName()).path()` + `DzDir.cdUp()` (the up-count is computed from the actual
+  `content_folder`/`vendor`/`product` path-segment count, not assumed fixed, since a real Daz
+  `content_folder` can itself contain slashes). `_rewrite_fixup_script_paths` replaces both the
+  preset-path literal and every `setMap()` literal with calls to this helper, and raises if any
+  raw absolute-path `setMap()` call survives the rewrite (`image_copies` — reused from the
+  `image_file` rewrite pass — is the substitution table for both).
+  **Live-verified end-to-end**, not just unit-level: built a real synthetic export (armature +
+  textured mesh) with an external, unpacked texture (the case that previously broke because
+  `_resolve_image_file` reuses an existing on-disk file's path as-is rather than copying it into
+  the addon's own textures folder), packaged it, extracted the zip's `Content/` into a real
+  registered Daz Studio content directory (`C:/Users/.../My Library`) exactly as DIM would, and ran
+  the installed fixup script via `DzScript.loadFromFile()+execute()` (the faithful way to invoke a
+  file-based script — this project's own `daz_execute_file` MCP tool turned out to evaluate script
+  *text* inline rather than truly running it as a file, which left `getScriptFileName()` empty and
+  gave a red herring failure during the first verification pass; worth remembering for future
+  DazScript debugging through this tool). Confirmed via `daz_list_materials`: the material shader
+  correctly promoted from `DzDefaultMaterial` to `DzUberIrayMaterial`, and via a direct property
+  query (`isMapped()`/`getMapValue()`) that the Diffuse Color map genuinely loaded the installed
+  texture file (not null/unmapped). Test content cleaned up from the real content library
+  afterward.
+
 - [x] **DIM zip export option** — implemented in `dim_package.py` (`build_dim_package()`), wired
   into `EXPORT_OT_daz_duf` in `__init__.py` via a `create_dim_zip` checkbox (+
   `dim_product_name`/`dim_vendor_name`/`dim_content_folder`). Tier 1 only (`Manifest.dsx` +
@@ -121,6 +157,7 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## Done (recent, for context — see git log for full history)
 
+- [x] Fix DIM-installed textures/shader failing to load (fixup script path resolution)
 - [x] Add DIM package identity round-trip + Configure DIM Package... popup dialog
 - [x] Combine material fixup + rig transfer into one companion script
 - [x] Auto-fit standalone clothing exports via declarative `conform_target`
