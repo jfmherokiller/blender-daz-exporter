@@ -101,20 +101,50 @@ def _manifest_dsx(content_root, global_id):
     return "\n".join(lines)
 
 
-def _supplement_dsx(product_name):
+def _supplement_dsx(product_name, product_tags="DAZStudio4_5"):
     """Per daz-dim-packaging skill Step 5 - live-confirmed this is where
     DIM's "Ready to Install" list gets its displayed Product Name/Tag from."""
     return (
         '<ProductSupplement VERSION="0.1">\n'
         f' <ProductName VALUE="{product_name}"/>\n'
         ' <InstallTypes VALUE="Content"/>\n'
-        ' <ProductTags VALUE="DAZStudio4_5"/>\n'
+        f' <ProductTags VALUE="{product_tags}"/>\n'
         "</ProductSupplement>"
     )
 
 
+def _resolve_global_id(global_id):
+    """Blank -> fresh UUID (today's behavior, safe default for a genuinely
+    new package). Non-blank -> validated and reused as-is, so the caller can
+    pin the same GlobalID across re-exports of the same product - per the
+    daz-dim-packaging skill, DIM identifies a package by this value (plus
+    the Manifest's own bookkeeping), and it should never change once a
+    version has been distributed."""
+    if not global_id:
+        return str(uuid.uuid4())
+    try:
+        return str(uuid.UUID(global_id))
+    except ValueError:
+        raise ValueError(f'Global ID "{global_id}" is not a valid UUID')
+
+
+def _resolve_product_num_id(product_num_id):
+    """Blank -> fresh random 8-digit id (today's behavior). Non-blank ->
+    validated numeric and reused as-is (zero-padded to 8 digits, matching
+    the "IM<8-digit product ID>" naming convention), so the caller can
+    target/overwrite an existing installed package's zip-filename slot
+    instead of always producing a new one."""
+    if not product_num_id:
+        return f"{random.randint(10000000, 99999999)}"
+    text = str(product_num_id).strip()
+    if not text.isdigit():
+        raise ValueError(f'Product Number ID "{product_num_id}" must be numeric')
+    return f"{int(text):08d}"
+
+
 def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_name,
-                       vendor_name="Blender Export", content_folder="Props"):
+                       vendor_name="Blender Export", content_folder="Props",
+                       global_id=None, product_num_id=None, product_tags="DAZStudio4_5"):
     """
     Package `duf` (the dict export_duf()/export_duf_prop() returned, still
     carrying its "_fixup_script" bookkeeping key - popped here, never
@@ -134,7 +164,18 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     a safe generic choice since this exporter has no reliable way to know
     the real Daz content-type taxonomy leaf for arbitrary Blender content.
 
-    Returns the written zip's full path.
+    global_id/product_num_id: leave None/blank to auto-generate a fresh
+    identity (safe default for a genuinely new package, matches the old
+    always-random behavior). Pass a previously-used value to make this
+    export update/overwrite that same package's slot in DIM instead of
+    installing alongside it as a separate entry - see _resolve_global_id/
+    _resolve_product_num_id for the validation each undergoes.
+
+    Returns (zip_path, global_id, product_num_id) - the caller should
+    persist the resolved global_id/product_num_id (whether freshly
+    generated here or passed straight through) so a later re-export of the
+    same asset can reuse them instead of drifting to a new random identity
+    every time.
     """
     vendor = _safe_folder(vendor_name)
     product = _safe_folder(product_name)
@@ -151,8 +192,8 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     new_preset_path = f"/{support_prefix}/IrayUberBase.duf"
     fixup_text = _rewrite_fixup_preset_path(fixup_text, new_preset_path)
 
-    global_id = str(uuid.uuid4())
-    product_num_id = random.randint(10000000, 99999999)
+    global_id = _resolve_global_id(global_id)
+    product_num_id = _resolve_product_num_id(product_num_id)
     zip_name = f"IM{product_num_id}-01_{product.replace(' ', '')}.zip"
     os.makedirs(out_dir, exist_ok=True)
     out_zip_path = os.path.join(out_dir, zip_name)
@@ -178,7 +219,7 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
         pathlib.Path(stage_dir, "Manifest.dsx").write_text(
             _manifest_dsx(content_root, global_id), encoding="utf-8")
         pathlib.Path(stage_dir, "Supplement.dsx").write_text(
-            _supplement_dsx(product_name), encoding="utf-8")
+            _supplement_dsx(product_name, product_tags), encoding="utf-8")
 
         with zipfile.ZipFile(out_zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             stage_path = pathlib.Path(stage_dir)
@@ -188,4 +229,4 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
 
-    return out_zip_path
+    return out_zip_path, global_id, product_num_id

@@ -10,7 +10,7 @@ against a live session, without needing the addon registered). See
 bl_info = {
     "name": "Daz Studio Native Export (.duf)",
     "author": "Blender DUF Exporter",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (3, 0, 0),
     "location": "File > Export > Daz Studio Scene (.duf)",
     "description": "Export a rigged mesh (or multiple meshes sharing one armature, optionally as conforming clothing) as a native Daz Studio .duf scene file",
@@ -185,6 +185,32 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         description='On-disk folder under Content/ this asset installs under, e.g. "Props", "People", "Wardrobe" (cosmetic for a Tier 1 package - any value works)',
         default="Props",
     )
+    dim_global_id: StringProperty(
+        name="Global ID",
+        description=(
+            "UUID identifying this package across re-exports/updates in DIM. Leave blank to "
+            "auto-generate a fresh one (safe default for a genuinely new package); reuse the "
+            "same value across re-exports of the same product so DIM treats them as updates "
+            "to one package instead of separate installs - never change it once a version has "
+            "been distributed"
+        ),
+        default="",
+    )
+    dim_product_num_id: StringProperty(
+        name="Product Number ID",
+        description=(
+            "8-digit numeric ID baked into the zip filename (IM<id>-01_Name.zip) and shown in "
+            "DIM's Ready to Install list. Leave blank to auto-generate a random one; reuse the "
+            "same value to target/overwrite an existing installed package's slot instead of "
+            "creating a duplicate entry"
+        ),
+        default="",
+    )
+    dim_product_tags: StringProperty(
+        name="Product Tags",
+        description="Written verbatim to Supplement.dsx's ProductTags, shown by DIM in the Ready to Install list",
+        default="DAZStudio4_5",
+    )
 
     @classmethod
     def poll(cls, context):
@@ -223,13 +249,27 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         if self.create_dim_zip:
             asset_basename = os.path.splitext(os.path.basename(self.filepath))[0]
             try:
-                zip_path = dim_package.build_dim_package(
+                zip_path, global_id, product_num_id = dim_package.build_dim_package(
                     result, fixup_script, asset_basename,
                     out_dir=os.path.dirname(self.filepath),
                     product_name=self.dim_product_name or asset_basename,
                     vendor_name=self.dim_vendor_name,
                     content_folder=self.dim_content_folder,
+                    global_id=self.dim_global_id,
+                    product_num_id=self.dim_product_num_id,
+                    product_tags=self.dim_product_tags,
                 )
+                # Persist the resolved (possibly freshly-generated) identity
+                # back to the scene so the *next* export - via the N-panel,
+                # which copies these onto the operator at button-press time -
+                # reuses the same package identity instead of drifting to a
+                # new random one every time (see dim_package.build_dim_package
+                # docstring). Harmless for standalone File > Export too, just
+                # unused there since its own draw() doesn't expose these two.
+                settings = getattr(context.scene, "daz_export_settings", None)
+                if settings is not None:
+                    settings.dim_global_id = global_id
+                    settings.dim_product_num_id = product_num_id
                 msg += f" | DIM zip -> {zip_path}"
             except Exception as e:
                 self.report({"ERROR"}, f"Export succeeded but DIM zip packaging failed: {e}")
@@ -258,6 +298,7 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
             layout.prop(self, "dim_product_name")
             layout.prop(self, "dim_vendor_name")
             layout.prop(self, "dim_content_folder")
+            layout.prop(self, "dim_product_tags")
 
 
 def menu_func_export(self, context):
@@ -383,6 +424,109 @@ class DazExportSettings(bpy.types.PropertyGroup):
         description='On-disk folder under Content/ this asset installs under, e.g. "Props", "People", "Wardrobe" (cosmetic for a Tier 1 package - any value works)',
         default="Props",
     )
+    dim_global_id: StringProperty(
+        name="Global ID",
+        description=(
+            "UUID identifying this package across re-exports/updates in DIM. Leave blank to "
+            "auto-generate a fresh one (safe default for a genuinely new package); reuse the "
+            "same value across re-exports of the same product so DIM treats them as updates "
+            "to one package instead of separate installs - never change it once a version has "
+            "been distributed. Auto-filled here after every DIM export, whether triggered from "
+            "this panel or from a standalone File > Export, so the next export reuses it "
+            "automatically - see EXPORT_OT_daz_duf.execute()"
+        ),
+        default="",
+    )
+    dim_product_num_id: StringProperty(
+        name="Product Number ID",
+        description=(
+            "8-digit numeric ID baked into the zip filename (IM<id>-01_Name.zip) and shown in "
+            "DIM's Ready to Install list. Leave blank to auto-generate a random one; reuse the "
+            "same value to target/overwrite an existing installed package's slot instead of "
+            "creating a duplicate entry. Auto-filled here after every DIM export, same as "
+            "Global ID above"
+        ),
+        default="",
+    )
+    dim_product_tags: StringProperty(
+        name="Product Tags",
+        description="Written verbatim to Supplement.dsx's ProductTags, shown by DIM in the Ready to Install list",
+        default="DAZStudio4_5",
+    )
+    dim_author_name: StringProperty(
+        name="Author",
+        description=(
+            "Cosmetic author/artist name. Not used by the Tier 1 package this exporter "
+            "currently builds - reserved for when Tier 2 (Smart Content ContentDBInstall .dsx) "
+            "registration support is added, see the daz-dim-packaging skill's Step 3"
+        ),
+        default="",
+    )
+
+
+class EXPORT_OT_daz_dim_config(bpy.types.Operator):
+    """Popup dialog (invoke_props_dialog) for the full set of DIM package
+    identity/customization fields, launched from VIEW3D_PT_daz_export's
+    "Configure DIM Package..." button. Reads/writes the scene's
+    DazExportSettings directly (rather than its own operator properties +
+    a separate copy-on-click step like EXPORT_OT_daz_duf/VIEW3D_PT_daz_export
+    use) so edits take effect immediately on OK, without needing the main
+    export button pressed afterward."""
+    bl_idname = "export_scene.daz_dim_config"
+    bl_label = "Configure DIM Package"
+    bl_options = {"REGISTER"}
+
+    dim_product_name: StringProperty(name="Product Name")
+    dim_vendor_name: StringProperty(name="Vendor Folder")
+    dim_content_folder: StringProperty(name="Content Folder")
+    dim_global_id: StringProperty(
+        name="Global ID",
+        description="Leave blank to auto-generate on next export; fill in to reuse/target a specific package identity",
+    )
+    dim_product_num_id: StringProperty(
+        name="Product Number ID",
+        description="Leave blank to auto-generate on next export; fill in to reuse/target a specific package's zip-filename slot",
+    )
+    dim_product_tags: StringProperty(name="Product Tags")
+    dim_author_name: StringProperty(
+        name="Author",
+        description="Not used by the current Tier 1 package - reserved for future Tier 2 Smart Content support",
+    )
+
+    def invoke(self, context, event):
+        settings = context.scene.daz_export_settings
+        self.dim_product_name = settings.dim_product_name
+        self.dim_vendor_name = settings.dim_vendor_name
+        self.dim_content_folder = settings.dim_content_folder
+        self.dim_global_id = settings.dim_global_id
+        self.dim_product_num_id = settings.dim_product_num_id
+        self.dim_product_tags = settings.dim_product_tags
+        self.dim_author_name = settings.dim_author_name
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "dim_product_name")
+        layout.prop(self, "dim_vendor_name")
+        layout.prop(self, "dim_content_folder")
+        layout.separator()
+        layout.prop(self, "dim_global_id")
+        layout.prop(self, "dim_product_num_id")
+        layout.label(text="Leave either ID blank to auto-generate a fresh one on next export", icon="INFO")
+        layout.separator()
+        layout.prop(self, "dim_product_tags")
+        layout.prop(self, "dim_author_name")
+
+    def execute(self, context):
+        settings = context.scene.daz_export_settings
+        settings.dim_product_name = self.dim_product_name
+        settings.dim_vendor_name = self.dim_vendor_name
+        settings.dim_content_folder = self.dim_content_folder
+        settings.dim_global_id = self.dim_global_id
+        settings.dim_product_num_id = self.dim_product_num_id
+        settings.dim_product_tags = self.dim_product_tags
+        settings.dim_author_name = self.dim_author_name
+        return {"FINISHED"}
 
 
 class VIEW3D_PT_daz_export(bpy.types.Panel):
@@ -426,6 +570,8 @@ class VIEW3D_PT_daz_export(bpy.types.Panel):
             layout.prop(settings, "dim_product_name")
             layout.prop(settings, "dim_vendor_name")
             layout.prop(settings, "dim_content_folder")
+            layout.operator(EXPORT_OT_daz_dim_config.bl_idname,
+                             text="Configure DIM Package...", icon="PREFERENCES")
         layout.separator()
 
         op = layout.operator(EXPORT_OT_daz_duf.bl_idname,
@@ -441,12 +587,16 @@ class VIEW3D_PT_daz_export(bpy.types.Panel):
         op.dim_product_name = settings.dim_product_name
         op.dim_vendor_name = settings.dim_vendor_name
         op.dim_content_folder = settings.dim_content_folder
+        op.dim_global_id = settings.dim_global_id
+        op.dim_product_num_id = settings.dim_product_num_id
+        op.dim_product_tags = settings.dim_product_tags
 
 
 def register():
     bpy.utils.register_class(EXPORT_OT_daz_duf)
     bpy.utils.register_class(MATERIAL_PT_daz_export)
     bpy.utils.register_class(DazExportSettings)
+    bpy.utils.register_class(EXPORT_OT_daz_dim_config)
     bpy.utils.register_class(VIEW3D_PT_daz_export)
     bpy.types.Scene.daz_export_settings = PointerProperty(type=DazExportSettings)
     bpy.types.Material.daz_hide_on_export = bpy.props.BoolProperty(
@@ -469,6 +619,7 @@ def unregister():
     del bpy.types.Material.daz_hide_on_export
     del bpy.types.Scene.daz_export_settings
     bpy.utils.unregister_class(VIEW3D_PT_daz_export)
+    bpy.utils.unregister_class(EXPORT_OT_daz_dim_config)
     bpy.utils.unregister_class(DazExportSettings)
     bpy.utils.unregister_class(MATERIAL_PT_daz_export)
     bpy.utils.unregister_class(EXPORT_OT_daz_duf)
