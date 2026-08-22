@@ -748,7 +748,22 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
         if channel_id == "Cutout Opacity" and val is not None and val >= 0.999:
             continue  # fully opaque, unlinked - no need to write, matches template default
         if val is not None:
-            overrides[channel_id] = (list(val[:3]) if channel_id == "Emission Color" else val, None)
+            if channel_id == "Emission Color":
+                # Daz's Emission Color channel is a plain multiplier on the
+                # emissive shader, not clamped to [0,1] - real Iray Uber
+                # materials commonly push it above 1 for a strong glow
+                # (documented Iray convention, not a guess). Folding
+                # Blender's separate Emission Strength multiplier in here
+                # is the direct equivalent of what Blender's own viewport/
+                # Cycles shading already does (final emission = color *
+                # strength) - unlike Bump Strength below, this isn't a
+                # cross-application unit-scale guess, it's the same
+                # multiply-two-linear-factors-together operation on both
+                # sides.
+                value_to_write = [c * strength for c in val[:3]]
+            else:
+                value_to_write = val
+            overrides[channel_id] = (value_to_write, None)
         elif img:
             # Iray Uber multiplies value * map - leaving value at None means
             # the fixup script never calls setValue(), so the channel keeps
@@ -762,7 +777,7 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
             # "let the map fully drive this channel" multiplier - same fix
             # already applied to Base Color (-> white) and Normal Map
             # (-> 1.0) above/below; this closes the gap for the rest.
-            emission_default = [1.0, 1.0, 1.0] if channel_id == "Emission Color" else 1.0
+            emission_default = [strength, strength, strength] if channel_id == "Emission Color" else 1.0
             overrides[channel_id] = (emission_default, img)
 
     spec_inp = _find_socket(bsdf, _SPECULAR_ALIASES)
@@ -771,6 +786,26 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
         overrides["Glossy Reflectivity"] = (val, None)
     elif img:
         overrides["Glossy Reflectivity"] = (1.0, img)
+
+    # Anisotropic/Anisotropic Rotation -> Glossy Anisotropy/Glossy Anisotropy
+    # Rotations: both sides use the same convention (Anisotropy: 0 = round
+    # highlight, 1 = fully stretched; Rotation: 0-1 fraction of a full turn),
+    # a direct 1:1 mapping with no unit-scale guess involved - matches IOR's
+    # reasoning above, unlike Bump Strength's cross-application scale gap.
+    aniso_inp = bsdf.inputs.get("Anisotropic")
+    val, img = resolve(aniso_inp, "Anisotropic")
+    if val is not None and val > 0:
+        overrides["Glossy Anisotropy"] = (val, None)
+    elif img:
+        overrides["Glossy Anisotropy"] = (1.0, img)
+
+    if "Glossy Anisotropy" in overrides:
+        aniso_rot_inp = bsdf.inputs.get("Anisotropic Rotation")
+        val, img = resolve(aniso_rot_inp, "AnisotropicRotation")
+        if val is not None:
+            overrides["Glossy Anisotropy Rotations"] = (val, None)
+        elif img:
+            overrides["Glossy Anisotropy Rotations"] = (1.0, img)
 
     trans_inp = _find_socket(bsdf, _TRANSMISSION_ALIASES)
     val, img = resolve(trans_inp, "Transmission")
@@ -816,6 +851,17 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
             overrides["Top Coat Color"] = (list(val[:3]), None)
         elif img:
             overrides["Top Coat Color"] = ([1.0, 1.0, 1.0], img)
+
+        # Coat IOR: same direct 1:1 physical-quantity mapping as the base
+        # IOR channel above - only worth writing alongside an actual coat
+        # layer (template default 1.5 is already inert with Top Coat Weight
+        # at 0, same reasoning as roughness/tint just above).
+        coat_ior_inp = bsdf.inputs.get("Coat IOR")
+        val, img = resolve(coat_ior_inp, "CoatIOR")
+        if val is not None:
+            overrides["Top Coat IOR"] = (val, None)
+        elif img:
+            overrides["Top Coat IOR"] = (1.5, img)
 
     normal_inp = bsdf.inputs.get("Normal")
     if normal_inp is not None and normal_inp.is_linked:
