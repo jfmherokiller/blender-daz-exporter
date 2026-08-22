@@ -10,7 +10,7 @@ against a live session, without needing the addon registered). See
 bl_info = {
     "name": "Daz Studio Native Export (.duf)",
     "author": "Blender DUF Exporter",
-    "version": (0, 2, 2),
+    "version": (0, 3, 0),
     "blender": (3, 0, 0),
     "location": "File > Export > Daz Studio Scene (.duf)",
     "description": "Export a rigged mesh (or multiple meshes sharing one armature, optionally as conforming clothing) as a native Daz Studio .duf scene file",
@@ -21,7 +21,7 @@ import os
 
 import bpy
 from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty
+from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty, PointerProperty
 
 from . import duf_export
 from . import dim_package
@@ -295,9 +295,160 @@ class MATERIAL_PT_daz_export(bpy.types.Panel):
             layout.label(text="so other morphs stay intact)")
 
 
+class DazExportSettings(bpy.types.PropertyGroup):
+    """Scene-level mirror of EXPORT_OT_daz_duf's own properties, so
+    VIEW3D_PT_daz_export's N-panel widgets have somewhere to persist their
+    values between exports - operator properties alone only remember the
+    last-used values via the post-export redo panel, not before the
+    operator has ever run. VIEW3D_PT_daz_export copies these onto the
+    operator button at draw time (op.<name> = settings.<name>) rather than
+    the operator reading them itself, so File > Export still works
+    standalone with the operator's own defaults."""
+    export_as_clothing: BoolProperty(
+        name="Export as Conforming Clothing",
+        description=(
+            "Mark this as a wardrobe item (skeleton pruned to only the bones it actually "
+            "uses) instead of a standalone figure. Use Daz Studio's own \"Fit To\" feature "
+            "after importing both files to make it follow the body figure's pose"
+        ),
+        default=False,
+    )
+    presentation_type: StringProperty(
+        name="Wardrobe Category",
+        description='Daz asset category, e.g. "Follower/Wardrobe/Top", ".../Pant", ".../Suit"',
+        default="Follower/Wardrobe/Top",
+    )
+    preferred_base: StringProperty(
+        name="Fits Figure",
+        description='Name of the figure this is meant to fit, e.g. "/MyCharacter" '
+                     "(cosmetic - shown in Daz's Smart Content matching, does not force-apply Fit To)",
+        default="",
+    )
+    root_mesh_name: StringProperty(
+        name="Root Mesh",
+        description=(
+            "Which selected mesh becomes the main posable figure. Every other mesh becomes a "
+            "separate attached figure conform_target-ed to it. Leave blank to use the first "
+            "mesh in the selection. Ignored when only one mesh is being exported"
+        ),
+        default="",
+    )
+    bake_textures: BoolProperty(
+        name="Bake Procedural Textures",
+        description=(
+            "Bake procedurally-fed material channels (Mix/AO/Noise node graphs) to flat "
+            "textures via Cycles. Usually more accurate, but can produce a flat, detail-less "
+            "result for materials mixing an image with a procedural Noise Texture on small/"
+            "thin mesh regions (e.g. a tail). Turn off to skip baking and reuse whatever real "
+            "image texture is upstream instead - less exact, but predictable"
+        ),
+        default=True,
+    )
+    morph_smooth_iterations: IntProperty(
+        name="Morph Smoothing Passes",
+        description=(
+            "Smooth shape-key deltas before export to avoid the jagged/faceted look sparse "
+            "per-vertex morph deltas otherwise produce (a known problem with PMX-style morph "
+            "import). 0 disables smoothing"
+        ),
+        default=2, min=0, max=10,
+    )
+    morph_smooth_factor: FloatProperty(
+        name="Morph Smoothing Strength",
+        description="How strongly each smoothing pass blends toward the neighbor average (0 = no effect, 1 = full blend)",
+        default=0.5, min=0.0, max=1.0,
+    )
+    create_dim_zip: BoolProperty(
+        name="Also Build DIM-Installable .zip",
+        description=(
+            "Additionally package the exported .duf, its textures, and its fixup script into a "
+            "DAZ Install Manager (DIM) installable .zip next to the .duf - drop it in DIM's "
+            "Downloads folder and click Install. Tier 1 only (no Smart Content icon/category) - "
+            "see the daz-dim-packaging skill for what that means"
+        ),
+        default=False,
+    )
+    dim_product_name: StringProperty(
+        name="Product Name",
+        description="Shown in DIM's Ready to Install list. Leave blank to use the export filename",
+        default="",
+    )
+    dim_vendor_name: StringProperty(
+        name="Vendor Folder",
+        description="On-disk vendor/author folder segment under Content/ (cosmetic - doesn't need to match any storefront name)",
+        default="Blender Export",
+    )
+    dim_content_folder: StringProperty(
+        name="Content Folder",
+        description='On-disk folder under Content/ this asset installs under, e.g. "Props", "People", "Wardrobe" (cosmetic for a Tier 1 package - any value works)',
+        default="Props",
+    )
+
+
+class VIEW3D_PT_daz_export(bpy.types.Panel):
+    """N-panel (3D viewport Sidebar, press N) tab holding every export
+    option ahead of time, so repeated exports don't need the file-browser's
+    operator-redo sidebar reopened and re-filled each time. The actual
+    export still goes through EXPORT_OT_daz_duf (and still shows its file
+    browser) - this panel just pre-fills that operator's properties from
+    DazExportSettings when its button is clicked."""
+    bl_label = "Export to Daz Studio"
+    bl_idname = "VIEW3D_PT_daz_export"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Daz Export"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.daz_export_settings
+
+        _, _, err = _selected_rigged_meshes(context)
+        if err:
+            layout.label(text=err, icon="ERROR")
+        else:
+            layout.label(text="Ready to export", icon="CHECKMARK")
+
+        layout.prop(settings, "export_as_clothing")
+        if settings.export_as_clothing:
+            layout.prop(settings, "presentation_type")
+            layout.prop(settings, "preferred_base")
+        layout.separator()
+        layout.prop(settings, "root_mesh_name")
+        layout.separator()
+        layout.prop(settings, "bake_textures")
+        layout.separator()
+        layout.prop(settings, "morph_smooth_iterations")
+        if settings.morph_smooth_iterations > 0:
+            layout.prop(settings, "morph_smooth_factor")
+        layout.separator()
+        layout.prop(settings, "create_dim_zip")
+        if settings.create_dim_zip:
+            layout.prop(settings, "dim_product_name")
+            layout.prop(settings, "dim_vendor_name")
+            layout.prop(settings, "dim_content_folder")
+        layout.separator()
+
+        op = layout.operator(EXPORT_OT_daz_duf.bl_idname,
+                              text="Export Daz Studio Scene (.duf)...", icon="EXPORT")
+        op.export_as_clothing = settings.export_as_clothing
+        op.presentation_type = settings.presentation_type
+        op.preferred_base = settings.preferred_base
+        op.root_mesh_name = settings.root_mesh_name
+        op.bake_textures = settings.bake_textures
+        op.morph_smooth_iterations = settings.morph_smooth_iterations
+        op.morph_smooth_factor = settings.morph_smooth_factor
+        op.create_dim_zip = settings.create_dim_zip
+        op.dim_product_name = settings.dim_product_name
+        op.dim_vendor_name = settings.dim_vendor_name
+        op.dim_content_folder = settings.dim_content_folder
+
+
 def register():
     bpy.utils.register_class(EXPORT_OT_daz_duf)
     bpy.utils.register_class(MATERIAL_PT_daz_export)
+    bpy.utils.register_class(DazExportSettings)
+    bpy.utils.register_class(VIEW3D_PT_daz_export)
+    bpy.types.Scene.daz_export_settings = PointerProperty(type=DazExportSettings)
     bpy.types.Material.daz_hide_on_export = bpy.props.BoolProperty(
         name="Hide From Daz Export",
         description=(
@@ -316,6 +467,9 @@ def register():
 def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     del bpy.types.Material.daz_hide_on_export
+    del bpy.types.Scene.daz_export_settings
+    bpy.utils.unregister_class(VIEW3D_PT_daz_export)
+    bpy.utils.unregister_class(DazExportSettings)
     bpy.utils.unregister_class(MATERIAL_PT_daz_export)
     bpy.utils.unregister_class(EXPORT_OT_daz_duf)
 

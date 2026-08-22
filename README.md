@@ -23,7 +23,9 @@ rebuilt per major Daz Studio version — see `../MMDImporter_ANALYSIS.md` for wh
 ## Use
 
 1. Select a mesh object that has an **Armature modifier** pointing at its rig.
-2. **File > Export > Daz Studio Scene (.duf)**.
+2. **File > Export > Daz Studio Scene (.duf)**, or open the 3D viewport Sidebar (press **N**) and
+   use the **Daz Export** tab — same options, but they persist between exports instead of
+   resetting each time you reopen the file browser.
 3. In Daz Studio: **File > Import...**, pick the `.duf`, or drag it into the viewport. Or, if you
    checked "Also Build DIM-Installable .zip", drop the generated `.zip` into DAZ Install Manager's
    Downloads folder and click Install instead.
