@@ -191,6 +191,134 @@ def _supplement_dsx(product_name, product_tags="DAZStudio4_5"):
     )
 
 
+_REGISTRATION_DSA = (
+    "// DAZ Studio version 0.0.0.0 filetype DAZ Script\n"
+    "if( App.version >= 67109158 ) //4.0.0.294\n"
+    "{\n"
+    "\tvar oFile = new DzFile( getScriptFileName() );\n"
+    "\tvar oAssetMgr = App.getAssetMgr();\n"
+    "\tif( oAssetMgr )\n"
+    "\t{\n"
+    "\t\toAssetMgr.queueDBMetaFile( oFile.baseName() );\n"
+    "\t}\n"
+    "}\n"
+)
+
+
+def _content_db_install_dsx(product_name, global_id, asset_rel_path, content_type, category,
+                             compatibility, compatibility_base, author_name,
+                             dsx_rel_path, support_asset_rel_paths):
+    """Per daz-dim-packaging skill Step 3 (Tier 2 only) - registers the
+    package into Daz Studio's own Content Database so Smart Content can
+    filter/badge it correctly. `global_id` must be byte-identical to
+    Manifest.dsx's GlobalID (skill's validation item 6) - both come from
+    the same _resolve_global_id() call in build_dim_package, never
+    generated independently. `Audience` is hardcoded to "Teens" - the only
+    value the skill has actually observed on a real shipped product; no
+    live-confirmed alternative exists to expose as a choice.
+
+    dsx_rel_path is this .dsx's own Content/-relative path (becomes the
+    <SupportAssets VALUE> attribute, per the skill); support_asset_rel_paths
+    lists every file the <Asset> depends on but that isn't itself browsable
+    - the three icons here (grid/tooltip/product)."""
+    compat_base_line = (
+        f'     <CompatibilityBase VALUE="{compatibility_base}"/>\n' if compatibility_base else ""
+    )
+    support_asset_lines = "\n".join(
+        f'    <SupportAsset VALUE="{p}"/>' for p in support_asset_rel_paths
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ContentDBInstall VERSION="1.0">\n'
+        " <Products>\n"
+        f'  <Product VALUE="{product_name}">\n'
+        '   <StoreID VALUE=""/>\n'
+        f'   <GlobalID VALUE="{global_id}"/>\n'
+        '   <ProductToken VALUE=""/>\n'
+        f'   <Artists><Artist VALUE="{author_name}"/></Artists>\n'
+        "   <Assets>\n"
+        f'    <Asset VALUE="{asset_rel_path}">\n'
+        f'     <ContentType VALUE="{content_type}"/>\n'
+        '     <Audience VALUE="Teens"/>\n'
+        f'     <Categories><Category VALUE="{category}"/></Categories>\n'
+        '     <Tags><Tag VALUE=""/></Tags>\n'
+        f'     <Compatibilities><Compatibility VALUE="{compatibility}"/></Compatibilities>\n'
+        f"{compat_base_line}"
+        '     <Userwords><Userword VALUE=""/></Userwords>\n'
+        "    </Asset>\n"
+        "   </Assets>\n"
+        f'   <SupportAssets VALUE="/{dsx_rel_path}">\n'
+        f"{support_asset_lines}\n"
+        "   </SupportAssets>\n"
+        "  </Product>\n"
+        " </Products>\n"
+        "</ContentDBInstall>"
+    )
+
+
+def _make_icon(width, height, dest_path, source_image_path=None):
+    """Produce one Tier 2 icon PNG at dest_path, exactly width x height.
+
+    If source_image_path is given, center-crop it to the target aspect
+    ratio then resize (no distortion). Otherwise generate a flat
+    placeholder - icon generation/rendering has no confirmed scriptable
+    path in this project for arbitrary Blender content (per the
+    daz-dim-packaging skill), so a placeholder is what lets Tier 2
+    registration prove out end-to-end; real per-product artwork can
+    replace these three files by hand later without touching anything
+    else in the package.
+
+    Uses bpy.data.images rather than an external imaging library since
+    this module only ever runs inside Blender's own process (imported by
+    the export operator) - same approach duf_export.py already uses for
+    _resolve_image_file/_extract_alpha_channel.
+    """
+    import bpy
+    import numpy as np
+
+    if source_image_path and os.path.isfile(source_image_path):
+        src_img = bpy.data.images.load(source_image_path)
+        try:
+            src_w, src_h = src_img.size
+            if src_w == 0 or src_h == 0:
+                raise ValueError(f"Icon source image has zero size: {source_image_path}")
+            channels = src_img.channels
+            pixels = np.empty(src_w * src_h * channels, dtype=np.float32)
+            src_img.pixels.foreach_get(pixels)
+            pixels = pixels.reshape((src_h, src_w, channels))
+
+            target_aspect = width / height
+            src_aspect = src_w / src_h
+            if src_aspect > target_aspect:
+                crop_w = max(1, round(src_h * target_aspect))
+                crop_h = src_h
+            else:
+                crop_w = src_w
+                crop_h = max(1, round(src_w / target_aspect))
+            x0 = (src_w - crop_w) // 2
+            y0 = (src_h - crop_h) // 2
+            cropped = pixels[y0:y0 + crop_h, x0:x0 + crop_w, :]
+
+            work_img = bpy.data.images.new("__daz_dim_icon__", width=crop_w, height=crop_h,
+                                            alpha=(channels == 4))
+            work_img.pixels.foreach_set(cropped.reshape(-1))
+            work_img.scale(width, height)
+        finally:
+            bpy.data.images.remove(src_img)
+    else:
+        work_img = bpy.data.images.new("__daz_dim_icon__", width=width, height=height, alpha=False)
+        flat = np.tile(np.array([0.55, 0.55, 0.55, 1.0], dtype=np.float32), width * height)
+        work_img.pixels.foreach_set(flat)
+
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        work_img.filepath_raw = dest_path
+        work_img.file_format = "PNG" if dest_path.lower().endswith(".png") else "JPEG"
+        work_img.save()
+    finally:
+        bpy.data.images.remove(work_img)
+
+
 def _resolve_global_id(global_id):
     """Blank -> fresh UUID (today's behavior, safe default for a genuinely
     new package). Non-blank -> validated and reused as-is, so the caller can
@@ -222,12 +350,20 @@ def _resolve_product_num_id(product_num_id):
 
 def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_name,
                        vendor_name="Blender Export", content_folder="Props",
-                       global_id=None, product_num_id=None, product_tags="DAZStudio4_5"):
+                       global_id=None, product_num_id=None, product_tags="DAZStudio4_5",
+                       tier2=False, content_type=None, category=None, compatibility=None,
+                       compatibility_base=None, author_name="", icon_image_path=None):
     """
     Package `duf` (the dict export_duf()/export_duf_prop() returned, still
     carrying its "_fixup_script" bookkeeping key - popped here, never
     written to disk) plus the companion fixup .dsa at fixup_script_path into
-    a Tier 1 DIM-installable .zip written into out_dir.
+    a DIM-installable .zip written into out_dir. Tier 1 (Manifest.dsx +
+    Supplement.dsx + Content/, DIM-installable but shows a broken-icon
+    placeholder in Smart Content) by default; pass tier2=True to also add
+    Runtime/Support ContentDBInstall .dsx/.dsa + icons, registering the
+    package into Daz Studio's own Content Database for a real thumbnail and
+    type/category badge - see the daz-dim-packaging skill for what each
+    tier actually gets you.
 
     asset_basename is the .duf's filename without extension (pass the
     export operator's own chosen filename, not duf["asset_info"]["id"] -
@@ -237,10 +373,14 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     vendor_name/product_name become on-disk folder segments
     (Content/<content_folder>/<vendor>/<product>/...) and the Supplement.dsx
     display name - sanitized internally, don't need to already be
-    filesystem-safe. content_folder is purely cosmetic (any string works for
-    a Tier 1 install - see daz-dim-packaging skill); defaults to "Props" as
-    a safe generic choice since this exporter has no reliable way to know
-    the real Daz content-type taxonomy leaf for arbitrary Blender content.
+    filesystem-safe. content_folder is purely cosmetic for Tier 1 (any
+    string works - see daz-dim-packaging skill); defaults to "Props" as a
+    safe generic choice since this exporter has no reliable way to know the
+    real Daz content-type taxonomy leaf for arbitrary Blender content. For
+    Tier 2, content_folder still only affects the on-disk path - it's
+    content_type/category below that actually drive Smart Content's badge
+    and category-tree placement, and the exporter can't guess those either,
+    so the caller (the DIM config dialog) must supply real taxonomy values.
 
     global_id/product_num_id: leave None/blank to auto-generate a fresh
     identity (safe default for a genuinely new package, matches the old
@@ -249,12 +389,27 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
     installing alongside it as a separate entry - see _resolve_global_id/
     _resolve_product_num_id for the validation each undergoes.
 
+    tier2=True requires content_type and category (both non-empty - Smart
+    Content needs a real ContentType and at least one Category per the
+    skill's validation checklist, and there's no sane generic default to
+    fall back to). compatibility defaults to "/AnySurface" if left blank -
+    the skill's own suggested default for genuinely generic content, which
+    is the only kind this exporter can assume for arbitrary Blender meshes.
+    compatibility_base is optional (only items with their own identity, per
+    the skill, get one) and author_name is cosmetic (Artists block).
+    icon_image_path is optional - if given, it's center-cropped/resized to
+    the three required icon sizes; if omitted, a flat placeholder is
+    generated instead (see _make_icon) so Tier 2 registration still proves
+    out end-to-end without requiring real artwork up front.
+
     Returns (zip_path, global_id, product_num_id) - the caller should
     persist the resolved global_id/product_num_id (whether freshly
     generated here or passed straight through) so a later re-export of the
     same asset can reuse them instead of drifting to a new random identity
     every time.
     """
+    if tier2 and (not content_type or not category):
+        raise ValueError("Tier 2 requires both a Content Type and a Category")
     vendor = _safe_folder(vendor_name)
     product = _safe_folder(product_name)
 
@@ -299,6 +454,28 @@ def build_dim_package(duf, fixup_script_path, asset_basename, out_dir, product_n
             if os.path.isfile(src):
                 shutil.copy2(src, content_root / dest_rel.lstrip("/"))
         shutil.copy2(duf_export._BUNDLED_UBER_BASE_PRESET, support_dir / "IrayUberBase.duf")
+
+        if tier2:
+            asset_rel_path = f"{content_folder}/{vendor}/{product}/{asset_basename}.duf"
+            grid_icon_rel = f"{content_folder}/{vendor}/{product}/{asset_basename}.duf.png"
+            tip_icon_rel = f"{content_folder}/{vendor}/{product}/{asset_basename}.tip.png"
+            reg_name = f"{vendor}_{product}".replace(" ", "")
+            reg_dsx_rel = f"{support_prefix}/{reg_name}.dsx"
+            reg_dsa_rel = f"{support_prefix}/{reg_name}.dsa"
+            product_icon_rel = f"{support_prefix}/{reg_name}.jpg"
+
+            _make_icon(91, 91, str(content_root / grid_icon_rel), icon_image_path)
+            _make_icon(250, 250, str(content_root / tip_icon_rel), icon_image_path)
+            _make_icon(114, 148, str(content_root / product_icon_rel), icon_image_path)
+
+            support_asset_rel_paths = [f"/{p}" for p in (product_icon_rel, grid_icon_rel, tip_icon_rel)]
+            dsx_text = _content_db_install_dsx(
+                product_name, global_id, asset_rel_path,
+                content_type, category, compatibility or "/AnySurface", compatibility_base,
+                author_name, reg_dsx_rel, support_asset_rel_paths,
+            )
+            (content_root / reg_dsx_rel).write_text(dsx_text, encoding="utf-8")
+            (content_root / reg_dsa_rel).write_text(_REGISTRATION_DSA, encoding="utf-8")
 
         pathlib.Path(stage_dir, "Manifest.dsx").write_text(
             _manifest_dsx(content_root, global_id), encoding="utf-8")

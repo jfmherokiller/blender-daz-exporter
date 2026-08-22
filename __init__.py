@@ -10,7 +10,7 @@ against a live session, without needing the addon registered). See
 bl_info = {
     "name": "Daz Studio Native Export (.duf)",
     "author": "Blender DUF Exporter",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (3, 0, 0),
     "location": "File > Export > Daz Studio Scene (.duf)",
     "description": "Export a rigged mesh (or multiple meshes sharing one armature, optionally as conforming clothing) as a native Daz Studio .duf scene file",
@@ -211,6 +211,51 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         description="Written verbatim to Supplement.dsx's ProductTags, shown by DIM in the Ready to Install list",
         default="DAZStudio4_5",
     )
+    dim_author_name: StringProperty(
+        name="Author",
+        description="Cosmetic artist/author name, written to Tier 2's ContentDBInstall Artists block (ignored for a Tier 1 package)",
+        default="",
+    )
+    dim_build_tier2: BoolProperty(
+        name="Register in Smart Content (Tier 2)",
+        description=(
+            "Also add a Runtime/Support ContentDBInstall .dsx/.dsa + icons, registering the "
+            "package into Daz Studio's own Content Database for a real thumbnail and type/"
+            "category badge in Smart Content, instead of Tier 1's broken-icon placeholder. "
+            "Requires Content Type and Category below - see the daz-dim-packaging skill"
+        ),
+        default=False,
+    )
+    dim_content_type: StringProperty(
+        name="Content Type",
+        description='Real Daz content-type taxonomy leaf, e.g. "Follower/Wardrobe/Shirt", "Script/Utility", "Actor/Character" - required for Tier 2',
+        default="",
+    )
+    dim_category: StringProperty(
+        name="Category",
+        description='Smart Content category tree path, e.g. "/Default/Wardrobe/Shirts", "/Default/Utilities/Scripts" - required for Tier 2',
+        default="",
+    )
+    dim_compatibility: StringProperty(
+        name="Compatibility",
+        description='e.g. "/Genesis 9/Base" for figure-specific content. Leave blank for "/AnySurface" (generic content)',
+        default="",
+    )
+    dim_compatibility_base: StringProperty(
+        name="Compatibility Base",
+        description='Only for content with its own identity (a wardrobe piece, a full character) - e.g. "/<Product Name>/<Item Name>". Leave blank to omit',
+        default="",
+    )
+    dim_icon_image: StringProperty(
+        name="Icon Image",
+        description=(
+            "Source image for the three Tier 2 icons (center-cropped/resized to each required "
+            "size). Leave blank to generate a flat placeholder instead - real artwork can "
+            "replace the packaged icon files by hand later"
+        ),
+        default="",
+        subtype="FILE_PATH",
+    )
 
     @classmethod
     def poll(cls, context):
@@ -258,6 +303,13 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
                     global_id=self.dim_global_id,
                     product_num_id=self.dim_product_num_id,
                     product_tags=self.dim_product_tags,
+                    tier2=self.dim_build_tier2,
+                    content_type=self.dim_content_type or None,
+                    category=self.dim_category or None,
+                    compatibility=self.dim_compatibility or None,
+                    compatibility_base=self.dim_compatibility_base or None,
+                    author_name=self.dim_author_name,
+                    icon_image_path=self.dim_icon_image or None,
                 )
                 # Persist the resolved (possibly freshly-generated) identity
                 # back to the scene so the *next* export - via the N-panel,
@@ -455,12 +507,48 @@ class DazExportSettings(bpy.types.PropertyGroup):
     )
     dim_author_name: StringProperty(
         name="Author",
+        description="Cosmetic artist/author name, written to Tier 2's ContentDBInstall Artists block (ignored for a Tier 1 package)",
+        default="",
+    )
+    dim_build_tier2: BoolProperty(
+        name="Register in Smart Content (Tier 2)",
         description=(
-            "Cosmetic author/artist name. Not used by the Tier 1 package this exporter "
-            "currently builds - reserved for when Tier 2 (Smart Content ContentDBInstall .dsx) "
-            "registration support is added, see the daz-dim-packaging skill's Step 3"
+            "Also add a Runtime/Support ContentDBInstall .dsx/.dsa + icons, registering the "
+            "package into Daz Studio's own Content Database for a real thumbnail and type/"
+            "category badge in Smart Content, instead of Tier 1's broken-icon placeholder. "
+            "Requires Content Type and Category below - see the daz-dim-packaging skill"
+        ),
+        default=False,
+    )
+    dim_content_type: StringProperty(
+        name="Content Type",
+        description='Real Daz content-type taxonomy leaf, e.g. "Follower/Wardrobe/Shirt", "Script/Utility", "Actor/Character" - required for Tier 2',
+        default="",
+    )
+    dim_category: StringProperty(
+        name="Category",
+        description='Smart Content category tree path, e.g. "/Default/Wardrobe/Shirts", "/Default/Utilities/Scripts" - required for Tier 2',
+        default="",
+    )
+    dim_compatibility: StringProperty(
+        name="Compatibility",
+        description='e.g. "/Genesis 9/Base" for figure-specific content. Leave blank for "/AnySurface" (generic content)',
+        default="",
+    )
+    dim_compatibility_base: StringProperty(
+        name="Compatibility Base",
+        description='Only for content with its own identity (a wardrobe piece, a full character) - e.g. "/<Product Name>/<Item Name>". Leave blank to omit',
+        default="",
+    )
+    dim_icon_image: StringProperty(
+        name="Icon Image",
+        description=(
+            "Source image for the three Tier 2 icons (center-cropped/resized to each required "
+            "size). Leave blank to generate a flat placeholder instead - real artwork can "
+            "replace the packaged icon files by hand later"
         ),
         default="",
+        subtype="FILE_PATH",
     )
 
 
@@ -488,9 +576,31 @@ class EXPORT_OT_daz_dim_config(bpy.types.Operator):
         description="Leave blank to auto-generate on next export; fill in to reuse/target a specific package's zip-filename slot",
     )
     dim_product_tags: StringProperty(name="Product Tags")
-    dim_author_name: StringProperty(
-        name="Author",
-        description="Not used by the current Tier 1 package - reserved for future Tier 2 Smart Content support",
+    dim_author_name: StringProperty(name="Author")
+    dim_build_tier2: BoolProperty(
+        name="Register in Smart Content (Tier 2)",
+        description="Adds ContentDBInstall .dsx/.dsa + icons for a real Smart Content thumbnail/badge - requires Content Type and Category below",
+    )
+    dim_content_type: StringProperty(
+        name="Content Type",
+        description='e.g. "Follower/Wardrobe/Shirt", "Script/Utility", "Actor/Character" - required for Tier 2',
+    )
+    dim_category: StringProperty(
+        name="Category",
+        description='e.g. "/Default/Wardrobe/Shirts", "/Default/Utilities/Scripts" - required for Tier 2',
+    )
+    dim_compatibility: StringProperty(
+        name="Compatibility",
+        description='e.g. "/Genesis 9/Base". Leave blank for "/AnySurface" (generic content)',
+    )
+    dim_compatibility_base: StringProperty(
+        name="Compatibility Base",
+        description="Only for content with its own identity. Leave blank to omit",
+    )
+    dim_icon_image: StringProperty(
+        name="Icon Image",
+        description="Source image for the three Tier 2 icons, center-cropped/resized to each size. Leave blank for a flat placeholder",
+        subtype="FILE_PATH",
     )
 
     def invoke(self, context, event):
@@ -502,6 +612,12 @@ class EXPORT_OT_daz_dim_config(bpy.types.Operator):
         self.dim_product_num_id = settings.dim_product_num_id
         self.dim_product_tags = settings.dim_product_tags
         self.dim_author_name = settings.dim_author_name
+        self.dim_build_tier2 = settings.dim_build_tier2
+        self.dim_content_type = settings.dim_content_type
+        self.dim_category = settings.dim_category
+        self.dim_compatibility = settings.dim_compatibility
+        self.dim_compatibility_base = settings.dim_compatibility_base
+        self.dim_icon_image = settings.dim_icon_image
         return context.window_manager.invoke_props_dialog(self, width=420)
 
     def draw(self, context):
@@ -516,6 +632,14 @@ class EXPORT_OT_daz_dim_config(bpy.types.Operator):
         layout.separator()
         layout.prop(self, "dim_product_tags")
         layout.prop(self, "dim_author_name")
+        layout.separator()
+        layout.prop(self, "dim_build_tier2")
+        if self.dim_build_tier2:
+            layout.prop(self, "dim_content_type")
+            layout.prop(self, "dim_category")
+            layout.prop(self, "dim_compatibility")
+            layout.prop(self, "dim_compatibility_base")
+            layout.prop(self, "dim_icon_image")
 
     def execute(self, context):
         settings = context.scene.daz_export_settings
@@ -526,6 +650,14 @@ class EXPORT_OT_daz_dim_config(bpy.types.Operator):
         settings.dim_product_num_id = self.dim_product_num_id
         settings.dim_product_tags = self.dim_product_tags
         settings.dim_author_name = self.dim_author_name
+        settings.dim_build_tier2 = self.dim_build_tier2
+        settings.dim_content_type = self.dim_content_type
+        settings.dim_category = self.dim_category
+        settings.dim_compatibility = self.dim_compatibility
+        settings.dim_compatibility_base = self.dim_compatibility_base
+        settings.dim_icon_image = self.dim_icon_image
+        if self.dim_build_tier2 and (not self.dim_content_type or not self.dim_category):
+            self.report({"ERROR"}, "Tier 2 requires both a Content Type and a Category - saved, but export will fail until both are filled in")
         return {"FINISHED"}
 
 
@@ -590,6 +722,13 @@ class VIEW3D_PT_daz_export(bpy.types.Panel):
         op.dim_global_id = settings.dim_global_id
         op.dim_product_num_id = settings.dim_product_num_id
         op.dim_product_tags = settings.dim_product_tags
+        op.dim_author_name = settings.dim_author_name
+        op.dim_build_tier2 = settings.dim_build_tier2
+        op.dim_content_type = settings.dim_content_type
+        op.dim_category = settings.dim_category
+        op.dim_compatibility = settings.dim_compatibility
+        op.dim_compatibility_base = settings.dim_compatibility_base
+        op.dim_icon_image = settings.dim_icon_image
 
 
 def register():
