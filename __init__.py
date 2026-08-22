@@ -10,18 +10,21 @@ against a live session, without needing the addon registered). See
 bl_info = {
     "name": "Daz Studio Native Export (.duf)",
     "author": "Blender DUF Exporter",
-    "version": (0, 2, 1),
+    "version": (0, 2, 2),
     "blender": (3, 0, 0),
     "location": "File > Export > Daz Studio Scene (.duf)",
     "description": "Export a rigged mesh (or multiple meshes sharing one armature, optionally as conforming clothing) as a native Daz Studio .duf scene file",
     "category": "Import-Export",
 }
 
+import os
+
 import bpy
 from bpy_extras.io_utils import ExportHelper
 from bpy.props import StringProperty, BoolProperty, IntProperty, FloatProperty
 
 from . import duf_export
+from . import dim_package
 
 
 def _rigged_children_of_armature(armature_obj):
@@ -157,6 +160,31 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         ),
         default=True,
     )
+    create_dim_zip: BoolProperty(
+        name="Also Build DIM-Installable .zip",
+        description=(
+            "Additionally package the exported .duf, its textures, and its fixup script into a "
+            "DAZ Install Manager (DIM) installable .zip next to the .duf - drop it in DIM's "
+            "Downloads folder and click Install. Tier 1 only (no Smart Content icon/category) - "
+            "see the daz-dim-packaging skill for what that means"
+        ),
+        default=False,
+    )
+    dim_product_name: StringProperty(
+        name="Product Name",
+        description="Shown in DIM's Ready to Install list. Leave blank to use the export filename",
+        default="",
+    )
+    dim_vendor_name: StringProperty(
+        name="Vendor Folder",
+        description="On-disk vendor/author folder segment under Content/ (cosmetic - doesn't need to match any storefront name)",
+        default="Blender Export",
+    )
+    dim_content_folder: StringProperty(
+        name="Content Folder",
+        description='On-disk folder under Content/ this asset installs under, e.g. "Props", "People", "Wardrobe" (cosmetic for a Tier 1 package - any value works)',
+        default="Props",
+    )
 
     @classmethod
     def poll(cls, context):
@@ -191,6 +219,22 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         msg = f"Exported [{names}] -> {self.filepath}"
         if fixup_script:
             msg += f" (run this once after loading: {fixup_script})"
+
+        if self.create_dim_zip:
+            asset_basename = os.path.splitext(os.path.basename(self.filepath))[0]
+            try:
+                zip_path = dim_package.build_dim_package(
+                    result, fixup_script, asset_basename,
+                    out_dir=os.path.dirname(self.filepath),
+                    product_name=self.dim_product_name or asset_basename,
+                    vendor_name=self.dim_vendor_name,
+                    content_folder=self.dim_content_folder,
+                )
+                msg += f" | DIM zip -> {zip_path}"
+            except Exception as e:
+                self.report({"ERROR"}, f"Export succeeded but DIM zip packaging failed: {e}")
+                return {"FINISHED"}
+
         self.report({"INFO"}, msg)
         return {"FINISHED"}
 
@@ -208,6 +252,12 @@ class EXPORT_OT_daz_duf(bpy.types.Operator, ExportHelper):
         layout.prop(self, "morph_smooth_iterations")
         if self.morph_smooth_iterations > 0:
             layout.prop(self, "morph_smooth_factor")
+        layout.separator()
+        layout.prop(self, "create_dim_zip")
+        if self.create_dim_zip:
+            layout.prop(self, "dim_product_name")
+            layout.prop(self, "dim_vendor_name")
+            layout.prop(self, "dim_content_folder")
 
 
 def menu_func_export(self, context):
