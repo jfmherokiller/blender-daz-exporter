@@ -24,11 +24,48 @@ file/function before starting, don't assume the note below is still 100% current
   bake), and confirmed the produced zip's shape, the rewritten `image_file` paths, and the
   physically staged textures/preset all match. Not yet tested against a real DIM install (do that
   before considering this fully proven, same caveat the daz-dim-packaging skill flags for Tier 2).
-  - Not done: no stable/reused `GlobalID` across re-exports of the same asset (fresh UUID every
-    time) — revisit only if that turns out to matter for real usage.
   - Reference: `/mnt/steamdrive/modelStuff/AIHelpers/plugins/daz/skills/daz-dim-packaging/SKILL.md`
     for the full on-disk schema, Tier 1 vs Tier 2 tradeoffs, and the live-confirmed validation
     checklist.
+
+- [x] **DIM package identity round-trips across re-exports + a dedicated config popup** — fixes
+  the "fresh UUID every time" gap noted above. `dim_package.build_dim_package()` now takes
+  `global_id`/`product_num_id`/`product_tags` kwargs (all optional) and returns
+  `(zip_path, global_id, product_num_id)` instead of just the path — blank in, fresh
+  UUID/8-digit-id out (old behavior, unchanged default); non-blank in, validated
+  (`_resolve_global_id`/`_resolve_product_num_id`) and reused as-is, so a caller can pin a
+  specific package identity to update/overwrite rather than install-alongside. `EXPORT_OT_daz_duf.
+  execute()` always writes the resolved (possibly freshly-generated) pair back onto
+  `context.scene.daz_export_settings` after a DIM build, regardless of entry point — so the *next*
+  export via the N-panel automatically reuses the same identity instead of drifting to a new
+  random one, with zero action needed from the user beyond leaving the fields blank the first time.
+  Added `DazExportSettings.dim_global_id`/`dim_product_num_id`/`dim_product_tags`/
+  `dim_author_name` and a new popup-dialog operator `EXPORT_OT_daz_dim_config`
+  (`bl_idname="export_scene.daz_dim_config"`, `invoke_props_dialog`) launched via a "Configure DIM
+  Package..." button in `VIEW3D_PT_daz_export`'s DIM section — reads/writes the scene settings
+  directly (not a copy-onto-operator-then-run step like the main export button), so edits apply
+  immediately on OK. `dim_author_name` is collected but **not yet wired into any output file** —
+  Tier 1's `Supplement.dsx`/`Manifest.dsx` have no author field per the daz-dim-packaging skill;
+  it's stashed on `DazExportSettings` for when Tier 2 (`Runtime/Support` `ContentDBInstall` .dsx,
+  which does have an `<Artists>` block) gets built. Standalone File > Export's own sidebar
+  (`EXPORT_OT_daz_duf.draw()`) deliberately does NOT expose Global ID/Product Number ID (only
+  `dim_product_tags`, which is harmless standalone) — those two only make sense with the
+  scene-settings persistence loop, which standalone-only usage never engages; every standalone
+  export still gets a fresh identity every time, same as before this change, so there's no
+  regression for that path, just no new persistence benefit either.
+  Verified against real headless Blender 5.2: registered the addon, confirmed
+  `EXPORT_OT_daz_dim_config` registers (`bpy.ops.export_scene.daz_dim_config`) with every expected
+  field, `DazExportSettings`/`EXPORT_OT_daz_duf` both carry the new fields via
+  `get_rna_type().properties`, `_resolve_global_id`/`_resolve_product_num_id` validate and
+  round-trip correctly (blank → fresh UUID/8-digit id; non-blank → reused verbatim; garbage input →
+  clean `ValueError`, caught by the existing `execute()` try/except and reported as an operator
+  error same as any other DIM build failure). Then a full synthetic export: built a real 1-bone
+  rig + cube mesh, called `export_duf()` + `build_dim_package()` twice back-to-back — first with
+  blank IDs (captured the generated `GlobalID`/product id), second passing those same values back
+  in — and confirmed the second run produced the **exact same zip filename** and a `Manifest.dsx`
+  whose `GlobalID` matched byte-for-byte, proving the reuse path actually works end-to-end, not
+  just that the properties exist. Not yet confirmed: the popup dialog's on-screen appearance/click
+  interaction (headless, no GUI) — registration-level and data-flow correctness only.
 
 - [x] **Expose export options in the N-panel (3D viewport Sidebar)** — implemented: added
   `DazExportSettings` (`bpy.types.PropertyGroup`, one field per export option, registered as
@@ -84,6 +121,7 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## Done (recent, for context — see git log for full history)
 
+- [x] Add DIM package identity round-trip + Configure DIM Package... popup dialog
 - [x] Combine material fixup + rig transfer into one companion script
 - [x] Auto-fit standalone clothing exports via declarative `conform_target`
 - [x] Expand Iray Uber material coverage: IOR, Clearcoat/Coat, Bump-node
