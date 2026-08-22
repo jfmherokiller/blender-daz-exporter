@@ -6,6 +6,42 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## In progress / next up
 
+- [x] **Tier 2 DIM packaging (Smart Content registration)** — `build_dim_package(..., tier2=True, ...)`
+  adds the `Runtime/Support` `ContentDBInstall` `.dsx`/`.dsa` + three icons per the
+  daz-dim-packaging skill's Tier 2, registering the package into Daz Studio's own Content Database
+  for a real thumbnail + type/category badge in Smart Content instead of Tier 1's broken-icon
+  placeholder. New `dim_package.py` pieces: `_content_db_install_dsx` (the `.dsx` XML - one
+  `<Asset>` for the shipped `.duf`, `content_type`/`category`/`compatibility`/`compatibility_base`/
+  `author_name` all caller-supplied since the exporter has no way to guess Daz's taxonomy for
+  arbitrary Blender content; `Audience` hardcoded to `"Teens"`, the only value the skill has
+  actually observed), `_REGISTRATION_DSA` (the fixed `queueDBMetaFile()` boilerplate, copied
+  verbatim per the skill), and `_make_icon` (91×91 grid / 250×250 tooltip / 114×148 product icons
+  via `bpy.data.images` — center-crop-then-scale from an optional user-supplied source image, or a
+  flat placeholder if none given; no external imaging library needed since this module only ever
+  runs inside Blender's own process). `global_id` is shared byte-for-byte between `Manifest.dsx`
+  and the `.dsx`'s `<Product><GlobalID>` (both come from the same `_resolve_global_id()` call) —
+  the skill's validation item 6 requires this, and it's structurally guaranteed here rather than
+  passed twice. Tier 2 requires non-empty `content_type`/`category` (raises otherwise, no sane
+  generic fallback exists); `compatibility` defaults to `/AnySurface` if left blank.
+  UI: a "Register in Smart Content (Tier 2)" toggle + Content Type/Category/Compatibility/
+  Compatibility Base/Icon Image fields, added only to `EXPORT_OT_daz_dim_config`'s popup dialog and
+  `DazExportSettings` (not the standalone File > Export sidebar) — deliberately scoped the same way
+  Global ID/Product Number ID already were: too many interdependent fields for the plain redo
+  panel, and standalone export has no way to supply them anyway.
+  **Verified**: structurally in headless Blender (real synthetic export → `build_dim_package(...,
+  tier2=True)` → zip contents inspected: `GlobalID` matches byte-for-byte between `Manifest.dsx`
+  and the `.dsx`, `ContentType`/`Category`/`Compatibility`/`Artist` all round-trip correctly, `.dsa`
+  contains the expected `queueDBMetaFile` call, all three icons come back at the exact required
+  pixel dimensions) and live against real Daz Studio: installed the built `Content/` into a real
+  registered content directory and ran the registration `.dsa` via `DzScript.loadFromFile()+
+  execute()` (same faithful-execution technique the texture-loading fix above required) — it
+  completed with no error, meaning `queueDBMetaFile()` accepted the generated `.dsx` without
+  complaint. **Not verified**: the actual Smart Content thumbnail/badge rendering itself, which per
+  the skill only happens on a real Content Library directory *scan* and requires visually
+  inspecting Daz Studio's Smart Content pane — no tool in this project's toolset can drive or read
+  that UI (unlike Blender/Chrome, which do have screenshot/automation tools). Test content cleaned
+  up from the real content library afterward.
+
 - [x] **Fix: textures/shader failed to load after a real DIM install** — root-caused and fixed via
   a real live-Daz-Studio reproduction (not just code inspection). Symptom: after installing a
   built DIM zip, the material stayed `DzDefaultMaterial` and threw
@@ -157,6 +193,7 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## Done (recent, for context — see git log for full history)
 
+- [x] Add Tier 2 DIM packaging (Smart Content .dsx/.dsa + icon registration)
 - [x] Fix DIM-installed textures/shader failing to load (fixup script path resolution)
 - [x] Add DIM package identity round-trip + Configure DIM Package... popup dialog
 - [x] Combine material fixup + rig transfer into one companion script
