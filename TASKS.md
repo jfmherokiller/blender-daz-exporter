@@ -6,6 +6,74 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## In progress / next up
 
+- [x] **Subsurface Scattering material mapping** — `_iray_overrides` now maps Blender's Principled
+  BSDF SSS sockets onto Daz's `/Volume/Scattering` group + `Thin Walled`. Researched via a parallel
+  workflow (Blender-side socket introspection + Daz-side schema/docs research, zero Daz Studio
+  interaction) followed by manual, one-call-at-a-time live Daz Studio verification (see below for
+  why manual, not another workflow agent, for the live part).
+  - **Mapping**: `Subsurface Weight` → `SSS Amount` (direct 1:1, both 0-1 mix factors — same value/
+    map priority as every other channel). `SSS Color` reuses the already-resolved `diffuse_rgb`/
+    `diffuse_image` (Blender 4.0+ dropped the separate `Subsurface Color` socket — tint comes
+    entirely from Base Color, confirmed live by enumerating all 32 Principled BSDF inputs on this
+    Blender 5.2). `Scattering Measurement Distance` = `max(Subsurface Radius channels) *
+    Subsurface Scale * 100` (Blender's per-channel Radius vector × Scale, in meters, collapsed to
+    Daz's single scalar "measured distance" channel via the max component, then converted to
+    centimeters with the same `*100` factor `to_daz_vec` already uses for geometry) — only computed
+    when both Radius and Scale are plain (non-texture-driven) values, since a linked/procedural
+    Radius has no clear meaning to "bake" into a single distance. `Subsurface Anisotropy` (Blender
+    0-1 forward-scattering factor) → `SSS Direction` (Daz's -1..1 Henyey-Greenstein "g" parameter)
+    as a direct value copy over the positive half of Daz's range, same convention as the existing
+    Anisotropic → Glossy Anisotropy mapping. **`Thin Walled` is force-set to `false` whenever SSS is
+    used at all** — this is the load-bearing fix, not a style choice: the stock Iray Uber Base
+    preset ships with `Thin Walled = true`, which makes the entire `/Volume/Scattering` group inert
+    regardless of what SSS Amount/Color/Distance are set to. Missing this would have shipped a
+    "looks right in the generated script, does nothing when rendered" bug, exactly like the DIM
+    texture-path bug above.
+  - **Real bug caught and fixed along the way**: `_js_channel_value_snippet` (the fixup-script
+    generator) built its `setValue()` call via an f-string (`f"{prop_expr}.setValue({value});"`),
+    which is fine for numbers but renders a Python `bool` as `False`/`True` — invalid JavaScript.
+    `Thin Walled` is the first bool-typed channel this exporter has ever written, so this would
+    have been a silent, invisible failure (the fixup script would throw a JS syntax error only when
+    actually run in Daz, not when Blender exports it). Fixed by switching to `json.dumps(value)`,
+    which is a no-op for every numeric value already in use and correctly renders `false`/`true`.
+  - **Deliberately NOT mapped**: `Translucency Weight`/`Color`, `Base Color Effect`, `SSS
+    Reflectance Tint`, `SSS Mode`, `Transmitted Color`/`Measurement Distance` — no Blender-side
+    socket has a clear correspondence to most of these (Translucency Weight in particular is a
+    Daz-only "thin surface" backlight concept with nothing analogous on the modern Principled
+    BSDF), and this environment has no commercially-authored skin content to observe how real
+    products actually configure them (see below) — left at template default rather than guessed,
+    matching this file's existing Bump Strength/Sheen precedent for "don't invent a mapping without
+    a way to ground it."
+  - **Live verification, and an important environment limitation found along the way**: this
+    Daz Studio installation has no purchased/authored skin or character content — only the bare
+    `Genesis 9.duf`/`Genesis 8 Basic Female.duf` base figures ship by default, and their materials
+    sit at 100% raw Iray Uber Base template defaults (`SSS Amount=0`, `Translucency Weight=0`,
+    `Thin Walled=true`, etc., confirmed by loading `Genesis 9.duf` and reading every SSS-related
+    property back). So while the *mechanism* (setValue/setFloatColorValue/setMap semantics, enum
+    int-vs-string behavior, bool property behavior) is now live-confirmed against a real Daz Studio
+    session, the *choice* of which channels to map and how (documented above) could not be checked
+    against how a real shipped skin product actually authors them — flagged honestly rather than
+    presented as more confirmed than it is. Also confirmed live and reused for the fix above: enum
+    properties (`SSS Mode`, `Base Color Effect`) only accept the integer index via `setValue()` — a
+    string label like `"Chromatic"` is silently ignored (value stays unchanged, no error).
+    Full synthetic test (real armature + cube + Principled BSDF with Subsurface Weight=0.6, Radius=
+    (0.012, 0.006, 0.003)m, Scale=0.05m, Anisotropy=0.3): exported, loaded directly into Daz Studio,
+    ran the fixup script via `DzScript.loadFromFile()+execute()` (same faithful-execution technique
+    the DIM texture-loading fix required), and read every value back live — `DzUberIrayMaterial`,
+    `SSS Amount=0.6`, `SSS Direction=0.3`, `Scattering Measurement Distance=0.06`, `Thin Walled=0`
+    (false — confirms the bool-serialization fix actually took effect, not just that the generated
+    script text looked right), `SSS Color=[0.8,0.5,0.4,1]` matching Base Color — all exactly as
+    designed.
+  - **Process note for future sessions**: the research (Blender socket introspection + Daz schema/
+    docs reading) ran as a 2-agent parallel workflow since it was genuinely parallelizable and
+    touched zero Daz Studio state. The live Daz Studio verification was deliberately done directly
+    in conversation, one tool call at a time, rather than delegated to another workflow agent — Daz
+    Studio here is a single shared, stateful live process, and a spawned subagent can't pause
+    mid-task to ask the user something if a load looks risky (e.g. a content path with missing
+    dependencies hanging the server) the way the main conversation can. This split (workflow for
+    parallel zero-risk research, direct manual calls for the shared live resource) is worth
+    repeating for future Daz-verification tasks in this repo.
+
 - [x] **Tier 2 DIM packaging (Smart Content registration)** — `build_dim_package(..., tier2=True, ...)`
   adds the `Runtime/Support` `ContentDBInstall` `.dsx`/`.dsa` + three icons per the
   daz-dim-packaging skill's Tier 2, registering the package into Daz Studio's own Content Database
@@ -177,9 +245,6 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## Backlog (not yet scoped in detail)
 
-- [ ] **Subsurface Scattering material mapping** — split out from the material-channel-coverage
-  item above; needs live Daz Studio access to verify SSS Mode/Amount/Color/Direction semantics
-  before attempting, see the note there for why it wasn't bundled in.
 - [ ] **Displacement material mapping** — split out from the material-channel-coverage item above;
   needs new code that walks from the Material Output node's Displacement input rather than the
   Principled BSDF, unlike every channel `_iray_overrides` currently handles.
@@ -193,6 +258,7 @@ file/function before starting, don't assume the note below is still 100% current
 
 ## Done (recent, for context — see git log for full history)
 
+- [x] Add Subsurface Scattering material mapping (+ fix a Python-bool-to-JS fixup-script bug)
 - [x] Add Tier 2 DIM packaging (Smart Content .dsx/.dsa + icon registration)
 - [x] Fix DIM-installed textures/shader failing to load (fixup script path resolution)
 - [x] Add DIM package identity round-trip + Configure DIM Package... popup dialog
