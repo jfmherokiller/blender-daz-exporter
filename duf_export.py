@@ -863,6 +863,78 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
         elif img:
             overrides["Top Coat IOR"] = (1.5, img)
 
+    # Subsurface Scattering -> Daz's /Volume/Scattering group (SSS Amount/
+    # Color/Direction/Scattering Measurement Distance) + Thin Walled.
+    #
+    # Live-verified 2026-08-24 against a real Genesis 9 base figure: Thin
+    # Walled defaults to true on the stock Iray Uber Base preset, which
+    # makes the entire /Volume/Scattering group inert regardless of SSS
+    # Amount/Color - confirmed live (setValue(false) and setValue(0) both
+    # work on this DzBoolProperty). So Thin Walled must be explicitly
+    # flipped false whenever SSS is actually wanted here, or every other
+    # channel below silently does nothing. This environment has no
+    # commercially-authored skin content installed (only the bare, unskinned
+    # base figure), so only the raw preset's own template defaults could be
+    # confirmed this way - not how a real shipped skin product actually
+    # authors these channels day to day.
+    #
+    # Blender's Principled BSDF has no separate Subsurface Color input as of
+    # 4.0+ (tint comes entirely from Base Color - confirmed live by
+    # enumerating every input on this Blender version) and no direct analog
+    # to Daz's Translucency Weight/Color, Base Color Effect, or SSS
+    # Reflectance Tint (a thin-surface backlight effect distinct from true
+    # volumetric SSS) - those are deliberately left untouched here (stay at
+    # template default) rather than guessed, same as Sheen was deliberately
+    # left unmapped above for having no Daz equivalent.
+    sss_weight_inp = bsdf.inputs.get("Subsurface Weight") or bsdf.inputs.get("Subsurface")
+    val, img = resolve(sss_weight_inp, "SubsurfaceWeight")
+    if (val is not None and val > 0) or img:
+        overrides["SSS Amount"] = (val if val is not None else 1.0, img)
+        overrides["Thin Walled"] = (False, None)
+
+        # SSS Color: Daz's channel is the tint of light after scattering -
+        # the closest available analog is the same resolved Base Color
+        # value already feeding Diffuse Color above (Blender's own SSS
+        # model reuses Base Color as its scattering albedo, having no
+        # separate Subsurface Color input to read instead).
+        overrides["SSS Color"] = (list(diffuse_rgb[:3]), diffuse_image)
+
+        # Scattering Measurement Distance: Daz's single scalar "at this
+        # thickness, this color was measured" distance. Blender's per-
+        # channel Subsurface Radius (a mean-free-path vector, meters) times
+        # Subsurface Scale (also meters) is the closest physical analog;
+        # collapsed to one scalar via the max channel (the longest-
+        # travelling channel is usually the perceptually dominant one, e.g.
+        # skin's red channel) since Daz has no separate per-channel
+        # scattering-distance channel to receive the other two components.
+        # Converted meters -> centimeters with the same *100 factor this
+        # exporter already uses for every other Blender-to-Daz unit
+        # conversion (see to_daz_vec). Only handled when both Radius and
+        # Scale are plain values, not texture-driven - an extremely uncommon
+        # authoring pattern for these two sockets, and baking a "color" from
+        # a distance vector has no clear meaning, so this is left at the
+        # template default in that case rather than guessed.
+        radius_inp = bsdf.inputs.get("Subsurface Radius")
+        scale_inp = bsdf.inputs.get("Subsurface Scale")
+        if (radius_inp is not None and not radius_inp.is_linked
+                and scale_inp is not None and not scale_inp.is_linked):
+            radius_val = radius_inp.default_value[:3]
+            scale_val = scale_inp.default_value
+            distance_cm = max(radius_val) * scale_val * 100.0
+            if distance_cm > 0:
+                overrides["Scattering Measurement Distance"] = (distance_cm, None)
+
+        # SSS Direction: Daz's -1..1 Henyey-Greenstein phase-function
+        # anisotropy ("g") vs. Blender's 0..1 forward-scattering-only
+        # Anisotropy factor - same convention (0 = isotropic, higher =
+        # stronger forward scattering) over the positive half of Daz's
+        # range, a direct value copy like Anisotropic -> Glossy Anisotropy
+        # above, not a unit-scale guess.
+        aniso_ss_inp = bsdf.inputs.get("Subsurface Anisotropy")
+        val, img = resolve(aniso_ss_inp, "SubsurfaceAnisotropy")
+        if val is not None and val > 0:
+            overrides["SSS Direction"] = (val, None)
+
     normal_inp = bsdf.inputs.get("Normal")
     if normal_inp is not None and normal_inp.is_linked:
         normal_from_node = normal_inp.links[0].from_node
@@ -1252,7 +1324,14 @@ def _js_channel_value_snippet(prop_expr, value, image):
         r, g, b = value[0], value[1], value[2]
         lines.append(f"{prop_expr}.setFloatColorValue(new DzFloatColor({r}, {g}, {b}, 1.0));")
     elif value is not None:
-        lines.append(f"{prop_expr}.setValue({value});")
+        # json.dumps rather than an f-string interpolation: a Python bool
+        # (needed for Thin Walled, the first bool-typed channel this
+        # exporter writes) renders as "False"/"True" via str() - invalid JS
+        # - but correctly as "false"/"true" via json.dumps. Every existing
+        # numeric value already round-trips identically through either path
+        # (json.dumps(0.5) == str(0.5)), so this is strictly safer with no
+        # behavior change for the channels already in use.
+        lines.append(f"{prop_expr}.setValue({json.dumps(value)});")
     if image:
         lines.append(f"{prop_expr}.setMap({_js_str(image.replace(chr(92), '/'))});")
     return "\n".join(lines)
