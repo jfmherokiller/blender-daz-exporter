@@ -7,72 +7,108 @@ file/function before starting, don't assume the note below is still 100% current
 ## In progress / next up
 
 - [x] **Subsurface Scattering material mapping** — `_iray_overrides` now maps Blender's Principled
-  BSDF SSS sockets onto Daz's `/Volume/Scattering` group + `Thin Walled`. Researched via a parallel
-  workflow (Blender-side socket introspection + Daz-side schema/docs research, zero Daz Studio
-  interaction) followed by manual, one-call-at-a-time live Daz Studio verification (see below for
-  why manual, not another workflow agent, for the live part).
-  - **Mapping**: `Subsurface Weight` → `SSS Amount` (direct 1:1, both 0-1 mix factors — same value/
-    map priority as every other channel). `SSS Color` reuses the already-resolved `diffuse_rgb`/
-    `diffuse_image` (Blender 4.0+ dropped the separate `Subsurface Color` socket — tint comes
-    entirely from Base Color, confirmed live by enumerating all 32 Principled BSDF inputs on this
-    Blender 5.2). `Scattering Measurement Distance` = `max(Subsurface Radius channels) *
+  BSDF SSS sockets onto Daz's `/Volume/Scattering` group + `Thin Walled`, **and** (added in a second
+  pass, see "real-asset evidence" below) `/Base/Diffuse/Translucency` + `/Volume/Transmission`.
+  Researched via a parallel workflow (Blender-side socket introspection + Daz-side schema/docs
+  research, zero Daz Studio interaction), then manual one-call-at-a-time live Daz Studio
+  verification, then a second real-asset-grounded refinement pass (see below) — a spawned workflow
+  agent was deliberately NOT used for either live/data-touching part: Daz Studio here is a single
+  shared, stateful live process, and a subagent can't pause mid-task to ask the user something if a
+  load looks risky, the way the main conversation can.
+  - **Mapping**: `Subsurface Weight` → `SSS Amount` AND `Translucency Weight` (same source value/map
+    driving both — see real-asset evidence below for why both, not just one). `Base Color Effect` is
+    force-set to `1` ("Scatter & Transmit") whenever SSS is used. `SSS Color`/`Transmitted Color` =
+    the average RGB of the resolved Base Color (a flat value directly if Base Color is unlinked, or
+    the pixel-averaged color of the resolved texture via a new `_average_image_color` helper if
+    textured — **never the texture itself**, see below for why). `Scattering Measurement Distance`/
+    `Transmitted Measurement Distance` (same value for both) = `max(Subsurface Radius channels) *
     Subsurface Scale * 100` (Blender's per-channel Radius vector × Scale, in meters, collapsed to
-    Daz's single scalar "measured distance" channel via the max component, then converted to
-    centimeters with the same `*100` factor `to_daz_vec` already uses for geometry) — only computed
-    when both Radius and Scale are plain (non-texture-driven) values, since a linked/procedural
-    Radius has no clear meaning to "bake" into a single distance. `Subsurface Anisotropy` (Blender
-    0-1 forward-scattering factor) → `SSS Direction` (Daz's -1..1 Henyey-Greenstein "g" parameter)
-    as a direct value copy over the positive half of Daz's range, same convention as the existing
-    Anisotropic → Glossy Anisotropy mapping. **`Thin Walled` is force-set to `false` whenever SSS is
-    used at all** — this is the load-bearing fix, not a style choice: the stock Iray Uber Base
-    preset ships with `Thin Walled = true`, which makes the entire `/Volume/Scattering` group inert
-    regardless of what SSS Amount/Color/Distance are set to. Missing this would have shipped a
-    "looks right in the generated script, does nothing when rendered" bug, exactly like the DIM
-    texture-path bug above.
-  - **Real bug caught and fixed along the way**: `_js_channel_value_snippet` (the fixup-script
-    generator) built its `setValue()` call via an f-string (`f"{prop_expr}.setValue({value});"`),
-    which is fine for numbers but renders a Python `bool` as `False`/`True` — invalid JavaScript.
-    `Thin Walled` is the first bool-typed channel this exporter has ever written, so this would
-    have been a silent, invisible failure (the fixup script would throw a JS syntax error only when
-    actually run in Daz, not when Blender exports it). Fixed by switching to `json.dumps(value)`,
-    which is a no-op for every numeric value already in use and correctly renders `false`/`true`.
-  - **Deliberately NOT mapped**: `Translucency Weight`/`Color`, `Base Color Effect`, `SSS
-    Reflectance Tint`, `SSS Mode`, `Transmitted Color`/`Measurement Distance` — no Blender-side
-    socket has a clear correspondence to most of these (Translucency Weight in particular is a
-    Daz-only "thin surface" backlight concept with nothing analogous on the modern Principled
-    BSDF), and this environment has no commercially-authored skin content to observe how real
-    products actually configure them (see below) — left at template default rather than guessed,
-    matching this file's existing Bump Strength/Sheen precedent for "don't invent a mapping without
-    a way to ground it."
-  - **Live verification, and an important environment limitation found along the way**: this
-    Daz Studio installation has no purchased/authored skin or character content — only the bare
-    `Genesis 9.duf`/`Genesis 8 Basic Female.duf` base figures ship by default, and their materials
-    sit at 100% raw Iray Uber Base template defaults (`SSS Amount=0`, `Translucency Weight=0`,
-    `Thin Walled=true`, etc., confirmed by loading `Genesis 9.duf` and reading every SSS-related
-    property back). So while the *mechanism* (setValue/setFloatColorValue/setMap semantics, enum
-    int-vs-string behavior, bool property behavior) is now live-confirmed against a real Daz Studio
-    session, the *choice* of which channels to map and how (documented above) could not be checked
-    against how a real shipped skin product actually authors them — flagged honestly rather than
-    presented as more confirmed than it is. Also confirmed live and reused for the fix above: enum
-    properties (`SSS Mode`, `Base Color Effect`) only accept the integer index via `setValue()` — a
-    string label like `"Chromatic"` is silently ignored (value stays unchanged, no error).
-    Full synthetic test (real armature + cube + Principled BSDF with Subsurface Weight=0.6, Radius=
-    (0.012, 0.006, 0.003)m, Scale=0.05m, Anisotropy=0.3): exported, loaded directly into Daz Studio,
-    ran the fixup script via `DzScript.loadFromFile()+execute()` (same faithful-execution technique
-    the DIM texture-loading fix required), and read every value back live — `DzUberIrayMaterial`,
-    `SSS Amount=0.6`, `SSS Direction=0.3`, `Scattering Measurement Distance=0.06`, `Thin Walled=0`
-    (false — confirms the bool-serialization fix actually took effect, not just that the generated
-    script text looked right), `SSS Color=[0.8,0.5,0.4,1]` matching Base Color — all exactly as
-    designed.
-  - **Process note for future sessions**: the research (Blender socket introspection + Daz schema/
-    docs reading) ran as a 2-agent parallel workflow since it was genuinely parallelizable and
-    touched zero Daz Studio state. The live Daz Studio verification was deliberately done directly
-    in conversation, one tool call at a time, rather than delegated to another workflow agent — Daz
-    Studio here is a single shared, stateful live process, and a spawned subagent can't pause
-    mid-task to ask the user something if a load looks risky (e.g. a content path with missing
-    dependencies hanging the server) the way the main conversation can. This split (workflow for
-    parallel zero-risk research, direct manual calls for the shared live resource) is worth
-    repeating for future Daz-verification tasks in this repo.
+    Daz's single scalar "measured distance" via the max component, converted to centimeters with the
+    same `*100` factor `to_daz_vec` already uses for geometry) — only computed when Radius and Scale
+    are both plain (non-texture-driven) values. `Subsurface Anisotropy` (Blender 0-1 forward-
+    scattering factor) → `SSS Direction` (Daz's -1..1 Henyey-Greenstein "g" parameter) as a direct
+    value copy, same convention as the existing Anisotropic → Glossy Anisotropy mapping. **`Thin
+    Walled` is force-set to `false` whenever SSS is used at all** — the load-bearing fix, not a style
+    choice: the stock Iray Uber Base preset ships with `Thin Walled = true`, which makes the entire
+    `/Volume/Scattering` group inert regardless of what SSS Amount/Color/Distance are set to.
+    Deliberately still left untouched: `SSS Mode` (stays at the template's own `Mono` default —
+    real-asset evidence below confirmed this is actually the empirically correct choice, not just an
+    untested assumption) and `SSS Reflectance Tint`/`Translucency Color` (stayed at their own
+    template defaults on every real asset checked).
+  - **Real-asset evidence (the actual point of this pass)**: this Daz Studio *session* has no
+    purchased skin content loadable in-app, but real purchased products exist as plain `.zip` files
+    under `E:\DazStuff\Applications\Data\DAZ 3D\InstallManager\Downloads\` (DIM's own Downloads
+    folder — user-pointed) — and since a `.duf` inside one of those zips is just gzip-compressed (or
+    plain) JSON, it can be read directly with Python's `zipfile`/`gzip`/`json`, **with zero Daz
+    Studio involvement and zero risk of hanging the live server**. Read three real, independent
+    assets this way: two commercial Genesis 8 characters (`Reyna`/`Reynard`, different PAs, different
+    genders) and Daz's own official `Genesis 8 Basic Female.duf` base figure. All three confirmed,
+    consistently:
+    1. **Real skin always tunes Translucency Weight + Base Color Effect + Transmitted Color TOGETHER
+       with SSS Amount/Color/Distance, never SSS alone** — the original "SSS-group-only" scope this
+       mapping first shipped with was incomplete. `Base Color Effect` was `1` on all 3 samples.
+       `Translucency Weight` tracked `SSS Amount` at a similar-but-not-identical magnitude (0.5-0.6
+       vs 0.69-1.0); `Transmitted Color` tracked `SSS Color` similarly (both warm skin tones, not
+       identical). Blender's Principled BSDF has no second, independent control for this — one
+       `Subsurface Weight`/Base-Color-derived-tint drives all of it here.
+    2. **`SSS Color`/`Transmitted Color`/`SSS Reflectance Tint`/`Translucency Color` never had an
+       `image_file` key on any of the 3 samples** — always flat colors, even on materials whose
+       `Diffuse Color` *value* was plain white `[1,1,1]` with the real skin tone coming entirely from
+       an attached texture map. **This caught a real bug in the first version of this mapping**,
+       which reused `diffuse_image` directly for `SSS Color` — meaning any textured-Base-Color
+       material (virtually all real skin) would have gotten a meaningless white-with-attached-texture
+       `SSS Color`, not a real skin tone. Fixed with the new `_average_image_color` helper (same
+       `bpy.data.images` + numpy pixel-averaging idiom `_extract_alpha_channel` already uses) —
+       verified in a synthetic test with a known 4-pixel R/G/B/White texture, confirming the averaged
+       output and the absence of any `image_file` on the resulting channel.
+    3. **`SSS Mode` stayed `Mono` (0) on all 3 samples** — confirms the original mapping's choice to
+       leave it untouched (at the template's own Mono default) was empirically correct, not merely
+       conservative-by-luck.
+    4. **`Scattering Measurement Distance` real-world values were 0.12-2 (i.e. ~1mm-2cm)** — confirms
+       the cm-unit hypothesis behind the `*100` conversion, though the exact Blender
+       Radius/Scale-to-this-number relationship has no matching Blender-side source asset to check
+       the conversion factor itself against.
+    5. `Reyna`/`Reynard` (different PAs/genders) had **byte-identical** SSS/Translucency/Transmission
+       values — strong evidence these are inherited from a shared vendor/Daz-recommended base skin
+       recipe most PAs just don't touch beyond diffuse texture, not independently hand-tuned per
+       character; Daz's own base figure had similar-pattern but not identical numbers (its own
+       `Thin Walled` was already `false` in its material *library* baseline, and its `SSS Color`
+       stayed black/untouched) — so the pattern (which channels get tuned together, Mono mode, no
+       image maps) generalizes, but exact magnitudes are genuinely per-asset tunable, not hardcoded.
+  - **Also confirmed live** (mechanism, not choice-of-mapping): `setValue()` on an enum property
+    (`SSS Mode`, `Base Color Effect`) only accepts the integer index — a string label like
+    `"Chromatic"` is silently ignored, value stays unchanged, no error. `Thin Walled` is a
+    `DzBoolProperty` — `setValue(false)`/`setValue(0)` both work identically.
+  - **Real bug caught and fixed along the way (independent of the above)**: `_js_channel_value_snippet`
+    (the fixup-script generator) built its `setValue()` call via an f-string
+    (`f"{prop_expr}.setValue({value});"`), fine for numbers but rendering a Python `bool` as
+    `False`/`True` — invalid JavaScript. `Thin Walled` is the first bool-typed channel this exporter
+    has ever written, so this would have been a silent, invisible failure (only throwing when the
+    fixup script actually runs in Daz, not when Blender exports it). Fixed via `json.dumps(value)`,
+    a no-op for every numeric value already in use.
+  - **Verification, both passes**: full synthetic test (real armature + cube + Principled BSDF,
+    Subsurface Weight=0.6, Radius=(0.012, 0.006, 0.003)m, Scale=0.05m, Anisotropy=0.3, both a flat
+    and a textured Base Color) — exported, loaded directly into Daz Studio, ran the fixup script via
+    `DzScript.loadFromFile()+execute()` (the faithful way to invoke a file-based script — this
+    project's own `daz_execute_file` MCP tool turned out to evaluate script *text* inline rather than
+    truly running it as a file, which left `getScriptFileName()` empty and gave a red herring failure
+    on the first attempt; worth remembering for future DazScript debugging through this tool), and
+    read every value back live: `DzUberIrayMaterial`, `SSS Amount=0.6`, `SSS Direction=0.3`,
+    `Scattering Measurement Distance=0.06`, `Thin Walled=0` (false), `Translucency Weight=0.6`,
+    `Base Color Effect=1`, `Transmitted Measurement Distance=0.06`, `SSS Color=Transmitted
+    Color=[0.8,0.5,0.4,1]` matching Base Color — all exactly as designed. Test content/temp files
+    cleaned up afterward.
+  - **Process note for future sessions**: the initial research (Blender socket introspection + Daz
+    schema/docs reading) ran as a 2-agent parallel workflow since it was genuinely parallelizable and
+    touched zero Daz Studio state. Both the live Daz Studio verification AND the real-purchased-asset
+    reading were done directly in conversation rather than delegated to a workflow agent — the former
+    because Daz Studio is a shared live process a subagent can't pause to ask about, the latter
+    because it was cheap/fast enough (plain zip/gzip/json reads) not to need parallelizing. **If
+    real shipped Daz content is ever needed again for verification, check DIM's own Downloads folder
+    first** (`E:\DazStuff\Applications\Data\DAZ 3D\InstallManager\Downloads\` on this machine) — every
+    purchased product sits there as a `.zip` alongside its DIM sidecar `.dsx`, and a `.duf`/`.dsf`
+    inside can be read straight out of the zip (gzip-decompress if it starts with `\x1f\x8b`) with
+    zero Daz Studio involvement and zero risk to the live session.
 
 - [x] **Tier 2 DIM packaging (Smart Content registration)** — `build_dim_package(..., tier2=True, ...)`
   adds the `Runtime/Support` `ContentDBInstall` `.dsx`/`.dsa` + three icons per the
