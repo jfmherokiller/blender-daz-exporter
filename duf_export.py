@@ -382,6 +382,34 @@ def _resolve_image_file(image, out_dir, basename):
     return target if os.path.isfile(target) else None
 
 
+def _average_image_color(image_path):
+    """Average RGB color of an already-resolved image file on disk.
+
+    Used for Daz channels real shipped assets only ever author as a flat
+    value, never a texture map (SSS Color, Transmitted Color - confirmed by
+    reading three real assets straight out of their DIM zip/content-library
+    files: two independent commercial Genesis 8 characters and Daz's own
+    official "Genesis 8 Basic Female" base figure all had these channels as
+    plain floats with no "image_file" key, even on materials whose Diffuse
+    Color was textured - see TASKS.md). Loads the file fresh via
+    bpy.data.images.load() rather than needing the original node-graph
+    Image datablock, so it works uniformly whether the resolved image path
+    came from a direct texture reuse or a fresh bake."""
+    import numpy as np
+    img = bpy.data.images.load(image_path)
+    try:
+        w, h = img.size
+        if w == 0 or h == 0:
+            return [0.8, 0.8, 0.8]
+        channels = img.channels
+        pixels = np.empty(w * h * channels, dtype=np.float32)
+        img.pixels.foreach_get(pixels)
+        pixels = pixels.reshape((-1, channels))
+        return [float(pixels[:, 0].mean()), float(pixels[:, 1].mean()), float(pixels[:, 2].mean())]
+    finally:
+        bpy.data.images.remove(img)
+
+
 def _extract_alpha_channel(image, out_dir, basename):
     """
     Export just an Image's alpha channel as its own standalone grayscale
@@ -864,40 +892,78 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
             overrides["Top Coat IOR"] = (1.5, img)
 
     # Subsurface Scattering -> Daz's /Volume/Scattering group (SSS Amount/
-    # Color/Direction/Scattering Measurement Distance) + Thin Walled.
+    # Color/Direction/Scattering Measurement Distance) + Thin Walled, and
+    # (see below) /Base/Diffuse/Translucency + /Volume/Transmission.
     #
-    # Live-verified 2026-08-24 against a real Genesis 9 base figure: Thin
-    # Walled defaults to true on the stock Iray Uber Base preset, which
-    # makes the entire /Volume/Scattering group inert regardless of SSS
-    # Amount/Color - confirmed live (setValue(false) and setValue(0) both
-    # work on this DzBoolProperty). So Thin Walled must be explicitly
-    # flipped false whenever SSS is actually wanted here, or every other
-    # channel below silently does nothing. This environment has no
-    # commercially-authored skin content installed (only the bare, unskinned
-    # base figure), so only the raw preset's own template defaults could be
-    # confirmed this way - not how a real shipped skin product actually
-    # authors these channels day to day.
+    # Live-verified 2026-08-24 two ways. First, against a real Genesis 9
+    # base figure: Thin Walled defaults to true on the stock Iray Uber Base
+    # preset, which makes the entire /Volume/Scattering group inert
+    # regardless of SSS Amount/Color - confirmed live (setValue(false) and
+    # setValue(0) both work on this DzBoolProperty). So Thin Walled must be
+    # explicitly flipped false whenever SSS is actually wanted here, or
+    # every other channel below silently does nothing.
+    #
+    # Second, against real shipped assets: this Daz Studio install has no
+    # purchased skin content loadable in-app, but real ones exist as plain
+    # zip files under DIM's Downloads folder - reading three real .duf
+    # files directly out of those zips (no Daz Studio involved at all: two
+    # independent commercial Genesis 8 characters, "Reyna"/"Reynard", plus
+    # Daz's own official "Genesis 8 Basic Female" base figure) revealed:
+    # - Real skin ALWAYS tunes Translucency Weight, Base Color Effect, and
+    #   Transmitted Color TOGETHER with SSS Amount/Color/Distance, not
+    #   instead of them - the "SSS-only" scope this mapping originally
+    #   shipped with was incomplete. Base Color Effect was 1 ("Scatter &
+    #   Transmit") on all 3 samples. Translucency Weight tracked SSS Amount
+    #   at a similar but not identical magnitude (0.5-0.6 vs 0.69-1.0), and
+    #   Transmitted Color tracked SSS Color at a similar but not identical
+    #   warm tone - close enough that reusing the same computed values
+    #   below is a reasonable single-source-of-truth simplification, not an
+    #   independent guess.
+    # - None of SSS Color/Transmitted Color/SSS Reflectance Tint/
+    #   Translucency Color ever had an "image_file" key on any of the 3
+    #   samples, even on materials whose Diffuse Color value was left at
+    #   plain white [1,1,1] with the real skin tone coming entirely from an
+    #   attached texture map - i.e. these channels are flat-color-only by
+    #   real-world convention, confirming the previous version of this
+    #   mapping (which reused diffuse_image directly, attaching an image_file
+    #   no real asset has ever been observed to have here) was wrong. Fixed
+    #   below via _average_image_color.
+    # - SSS Mode stayed Mono (0) on all 3 samples (this mapping already
+    #   left it untouched at the template's own Mono default, so no change
+    #   needed - just now confirmed as the empirically correct choice
+    #   rather than an untested assumption).
+    # - Scattering Measurement Distance real-world values (0.12-2, i.e.
+    #   ~1mm-2cm) confirm the cm-unit hypothesis behind the conversion
+    #   below, though the exact Blender Radius/Scale -> this real number
+    #   relationship has no matching Blender-side source asset to check
+    #   the conversion factor itself against.
     #
     # Blender's Principled BSDF has no separate Subsurface Color input as of
     # 4.0+ (tint comes entirely from Base Color - confirmed live by
-    # enumerating every input on this Blender version) and no direct analog
-    # to Daz's Translucency Weight/Color, Base Color Effect, or SSS
-    # Reflectance Tint (a thin-surface backlight effect distinct from true
-    # volumetric SSS) - those are deliberately left untouched here (stay at
-    # template default) rather than guessed, same as Sheen was deliberately
-    # left unmapped above for having no Daz equivalent.
+    # enumerating every input on this Blender version) and no dedicated
+    # control distinct from Subsurface Weight for Translucency/Transmission
+    # - Daz splits "thin surface backlight" from "true volumetric SSS" into
+    # two systems that get tuned together in practice (per the real-asset
+    # evidence above), but Blender's model has only the one input, so the
+    # same resolved SSS weight/color drives both here rather than treating
+    # Translucency as a second, independently-sourced channel. SSS
+    # Reflectance Tint stayed at its own template default ([1,1,1]) on all
+    # 3 real samples - left untouched here too, matching that evidence
+    # rather than guessed.
     sss_weight_inp = bsdf.inputs.get("Subsurface Weight") or bsdf.inputs.get("Subsurface")
     val, img = resolve(sss_weight_inp, "SubsurfaceWeight")
     if (val is not None and val > 0) or img:
-        overrides["SSS Amount"] = (val if val is not None else 1.0, img)
+        weight = val if val is not None else 1.0
+        overrides["SSS Amount"] = (weight, img)
+        overrides["Translucency Weight"] = (weight, img)
+        overrides["Base Color Effect"] = (1, None)  # "Scatter & Transmit" - see real-asset evidence above
         overrides["Thin Walled"] = (False, None)
 
-        # SSS Color: Daz's channel is the tint of light after scattering -
-        # the closest available analog is the same resolved Base Color
-        # value already feeding Diffuse Color above (Blender's own SSS
-        # model reuses Base Color as its scattering albedo, having no
-        # separate Subsurface Color input to read instead).
-        overrides["SSS Color"] = (list(diffuse_rgb[:3]), diffuse_image)
+        # SSS Color / Transmitted Color: see real-asset evidence above for
+        # why this is always a flat average, never diffuse_image directly.
+        sss_color = _average_image_color(diffuse_image) if diffuse_image else list(diffuse_rgb[:3])
+        overrides["SSS Color"] = (sss_color, None)
+        overrides["Transmitted Color"] = (sss_color, None)
 
         # Scattering Measurement Distance: Daz's single scalar "at this
         # thickness, this color was measured" distance. Blender's per-
@@ -923,6 +989,13 @@ def _iray_overrides(mat, mesh_obj, textures_dir, id_prefix, bake_textures=True):
             distance_cm = max(radius_val) * scale_val * 100.0
             if distance_cm > 0:
                 overrides["Scattering Measurement Distance"] = (distance_cm, None)
+                # Transmitted Measurement Distance (/Volume/Transmission)
+                # tracked Scattering Measurement Distance at the same order
+                # of magnitude on all 3 real samples (0.3-0.5 vs 0.12-2) -
+                # reused here for the same single-source-of-truth reason as
+                # Translucency Weight/Transmitted Color above, since Blender
+                # has no second distance input to source it from instead.
+                overrides["Transmitted Measurement Distance"] = (distance_cm, None)
 
         # SSS Direction: Daz's -1..1 Henyey-Greenstein phase-function
         # anisotropy ("g") vs. Blender's 0..1 forward-scattering-only
